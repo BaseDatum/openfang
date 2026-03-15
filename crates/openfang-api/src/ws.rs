@@ -568,14 +568,18 @@ async fn handle_text_message(
             // Send message to agent with streaming
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
-            match state.kernel.send_message_streaming(
-                agent_id,
-                &content,
-                Some(kernel_handle),
-                None,
-                None,
-                ws_content_blocks,
-            ) {
+            match state
+                .kernel
+                .send_message_streaming(
+                    agent_id,
+                    &content,
+                    Some(kernel_handle),
+                    None,
+                    None,
+                    ws_content_blocks,
+                )
+                .await
+            {
                 Ok((mut rx, handle)) => {
                     // Forward stream events to WebSocket with debouncing.
                     //

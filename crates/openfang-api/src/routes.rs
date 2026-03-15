@@ -1428,14 +1428,18 @@ pub async fn send_message_stream(
     }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    let (rx, _handle) = match state.kernel.send_message_streaming(
-        agent_id,
-        &req.message,
-        Some(kernel_handle),
-        req.sender_id,
-        req.sender_name,
-        None, // SSE streaming doesn't support image attachments yet
-    ) {
+    let (rx, _handle) = match state
+        .kernel
+        .send_message_streaming(
+            agent_id,
+            &req.message,
+            Some(kernel_handle),
+            req.sender_id,
+            req.sender_name,
+            None, // SSE streaming doesn't support image attachments yet
+        )
+        .await
+    {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("Streaming message failed for agent {id}: {e}");

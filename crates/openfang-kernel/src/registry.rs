@@ -342,6 +342,17 @@ impl AgentRegistry {
         entry.last_active = chrono::Utc::now();
         Ok(())
     }
+
+    /// Update the cached prompt data (identity files, workspace context) for an agent.
+    pub fn set_prompt_cache(
+        &self,
+        id: AgentId,
+        cache: std::sync::Arc<openfang_types::agent::PromptCache>,
+    ) {
+        if let Some(mut entry) = self.agents.get_mut(&id) {
+            entry.prompt_cache = Some(cache);
+        }
+    }
 }
 
 impl Default for AgentRegistry {
@@ -399,6 +410,7 @@ mod tests {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: None,
         }
     }
 
