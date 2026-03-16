@@ -964,6 +964,34 @@ impl Default for ThinkingConfig {
     }
 }
 
+/// Programmatic Tool Calling (PTC) configuration.
+///
+/// When enabled, agents receive a single `execute_code` tool instead of
+/// individual tool JSON schemas. The LLM writes Python code that calls
+/// tools as functions, and only `print()` output enters the context window.
+/// This reduces context usage by 30-40%+ and eliminates multi-turn tool roundtrips.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PtcConfig {
+    /// Whether PTC is enabled globally (default: true).
+    /// Per-agent override via `ptc_enabled` in agent manifests.
+    pub enabled: bool,
+    /// Timeout for Python subprocess execution in seconds (default: 120).
+    pub timeout_secs: u64,
+    /// Maximum stdout size in bytes before truncation (default: 100000).
+    pub max_stdout_bytes: usize,
+}
+
+impl Default for PtcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: 120,
+            max_stdout_bytes: 100_000,
+        }
+    }
+}
+
 /// Top-level kernel configuration.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -1107,6 +1135,11 @@ pub struct KernelConfig {
     /// Heartbeat monitor settings.
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
+    /// Programmatic Tool Calling (PTC) configuration.
+    /// When enabled (default), agents get a single `execute_code` tool instead of
+    /// 50+ individual tool schemas, reducing context usage by 30-40%+.
+    #[serde(default)]
+    pub ptc: PtcConfig,
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1344,6 +1377,7 @@ impl Default for KernelConfig {
             auth: AuthConfig::default(),
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
+            ptc: PtcConfig::default(),
         }
     }
 }
