@@ -3323,6 +3323,7 @@ impl OpenFangKernel {
                 None
             },
             tool_blocklist: Vec::new(),
+            ptc_enabled: None,
             // Custom profile avoids ToolProfile-based expansion overriding the
             // explicit tool list.
             profile: if !def.tools.is_empty() {
@@ -6496,6 +6497,7 @@ mod tests {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            ptc_enabled: None,
         };
         manifest.capabilities.tools = vec!["file_read".to_string(), "web_fetch".to_string()];
         manifest.capabilities.agent_spawn = true;
@@ -6533,6 +6535,7 @@ mod tests {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            ptc_enabled: None,
         }
     }
 
