@@ -1058,6 +1058,7 @@ mod tests {
             identity: AgentIdentity::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: Default::default(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: AgentEntry = serde_json::from_str(&json).unwrap();
@@ -1120,6 +1121,7 @@ mod tests {
             },
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: Default::default(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: AgentEntry = serde_json::from_str(&json).unwrap();
