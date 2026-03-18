@@ -243,6 +243,13 @@ pub trait KernelHandle: Send + Sync {
         Err("Channel file data send not available".to_string())
     }
 
+    /// Touch the agent's `last_active` timestamp to signal the heartbeat monitor
+    /// that the agent is alive. Called during long-running PTC tool execution so
+    /// the agent isn't incorrectly marked as unresponsive.
+    fn touch_active(&self, _agent_id: &str) {
+        // Default: no-op. The kernel overrides this to update the registry.
+    }
+
     /// Spawn an agent with capability inheritance enforcement.
     /// `parent_caps` are the parent's granted capabilities. The kernel MUST verify
     /// that every capability in the child manifest is covered by `parent_caps`.
