@@ -817,6 +817,10 @@ pub async fn run_agent_loop(
                                 }
                                 // IPC tool request from Python
                                 Some(req) = ptc.ipc_server.request_rx.recv() => {
+                                    // Touch heartbeat: prove agent is alive during PTC execution
+                                    if let Some(ref kh) = kernel {
+                                        kh.touch_active(&caller_id_str);
+                                    }
                                     let eff_exec_policy = manifest.exec_policy.as_ref();
                                     let tool_result = tool_runner::execute_tool(
                                         &req.tool_call_id,
@@ -1923,6 +1927,10 @@ pub async fn run_agent_loop_streaming(
                                     break py_result.ok();
                                 }
                                 Some(req) = ptc.ipc_server.request_rx.recv() => {
+                                    // Touch heartbeat: prove agent is alive during PTC execution
+                                    if let Some(ref kh) = kernel {
+                                        kh.touch_active(&caller_id_str);
+                                    }
                                     let eff_exec_policy = manifest.exec_policy.as_ref();
                                     let tool_result = tool_runner::execute_tool(
                                         &req.tool_call_id,

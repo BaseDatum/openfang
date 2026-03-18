@@ -671,7 +671,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "key": { "type": "string", "description": "The storage key" },
-                    "value": { "type": "string", "description": "The value to store (JSON-encode objects/arrays, or pass a plain string)" }
+                    "value": { "description": "The value to store (string, number, boolean, object, or array)" }
                 },
                 "required": ["key", "value"]
             }),
@@ -1637,7 +1637,7 @@ fn tool_agent_list(kernel: Option<&Arc<dyn KernelHandle>>) -> Result<String, Str
     let kh = require_kernel(kernel)?;
     let agents = kh.list_agents();
     if agents.is_empty() {
-        return Ok("No agents currently running.".to_string());
+        return Ok("[]".to_string());
     }
     let mut output = format!("Running agents ({}):\n", agents.len());
     for a in &agents {
@@ -1683,7 +1683,16 @@ fn tool_memory_recall(
     let kh = require_kernel(kernel)?;
     let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
     match kh.memory_recall(key)? {
-        Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
+        Some(val) => match &val {
+            // Return raw string content to avoid double-encoding.
+            // When an LLM stores `json.dumps({...})` via PTC, the value is
+            // `Value::String("{...}")`. Without this unwrap, `to_string_pretty`
+            // would produce `"\"{...}\""` — a double-encoded string that the
+            // caller must parse twice.
+            serde_json::Value::String(s) => Ok(s.clone()),
+            other => Ok(serde_json::to_string_pretty(other)
+                .unwrap_or_else(|_| other.to_string())),
+        },
         None => Ok(format!("No value found for key '{key}'.")),
     }
 }
@@ -1756,7 +1765,7 @@ async fn tool_task_claim(
         Some(task) => {
             serde_json::to_string_pretty(&task).map_err(|e| format!("Serialize error: {e}"))
         }
-        None => Ok("No tasks available.".to_string()),
+        None => Ok("null".to_string()),
     }
 }
 
@@ -1783,7 +1792,7 @@ async fn tool_task_list(
     let status = input["status"].as_str();
     let tasks = kh.task_list(status).await?;
     if tasks.is_empty() {
-        return Ok("No tasks found.".to_string());
+        return Ok("[]".to_string());
     }
     serde_json::to_string_pretty(&tasks).map_err(|e| format!("Serialize error: {e}"))
 }
