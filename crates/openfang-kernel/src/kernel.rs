@@ -2575,7 +2575,7 @@ impl OpenFangKernel {
                 max_tokens: manifest.model.max_tokens,
                 temperature: manifest.model.temperature,
                 system: Some(manifest.model.system_prompt.clone()),
-                thinking: None,
+                thinking: manifest.model.thinking.clone(),
             };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(
@@ -3063,6 +3063,28 @@ impl OpenFangKernel {
         Ok(())
     }
 
+    /// Set extended thinking configuration for an agent.
+    ///
+    /// Pass `None` to disable thinking, or build a `ThinkingConfig` from a
+    /// named level using [`ThinkingConfig::from_level`].
+    ///
+    /// The change is persisted to storage immediately and takes effect on the
+    /// next LLM call.
+    pub fn set_agent_thinking(
+        &self,
+        agent_id: AgentId,
+        thinking: Option<openfang_types::config::ThinkingConfig>,
+    ) -> KernelResult<()> {
+        self.registry
+            .update_thinking(agent_id, thinking)
+            .map_err(KernelError::OpenFang)?;
+        if let Some(entry) = self.registry.get(agent_id) {
+            let _ = self.memory.save_agent(&entry);
+        }
+        info!(agent_id = %agent_id, "Agent thinking config updated");
+        Ok(())
+    }
+
     /// Update an agent's skill allowlist. Empty = all skills (backward compat).
     pub fn set_agent_skills(&self, agent_id: AgentId, skills: Vec<String>) -> KernelResult<()> {
         // Validate skill names if allowlist is non-empty
@@ -3421,6 +3443,7 @@ impl OpenFangKernel {
                 system_prompt: def.agent.system_prompt.clone(),
                 api_key_env: def.agent.api_key_env.clone(),
                 base_url: def.agent.base_url.clone(),
+                thinking: None,
             },
             capabilities: ManifestCapabilities {
                 tools: def.tools.clone(),

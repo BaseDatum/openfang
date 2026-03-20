@@ -959,6 +959,46 @@ impl Default for ThinkingConfig {
     }
 }
 
+impl ThinkingConfig {
+    /// Build a `ThinkingConfig` from a named level string.
+    ///
+    /// | Level    | `budget_tokens` |
+    /// |----------|----------------|
+    /// | `"low"`    | 1 500          |
+    /// | `"medium"` | 10 000         |
+    /// | `"high"`   | 32 000         |
+    ///
+    /// Returns `None` for `"off"` / `"none"` / unknown values.
+    pub fn from_level(level: &str) -> Option<Self> {
+        match level {
+            "low" => Some(Self {
+                budget_tokens: 1_500,
+                stream_thinking: false,
+            }),
+            "medium" => Some(Self {
+                budget_tokens: 10_000,
+                stream_thinking: false,
+            }),
+            "high" => Some(Self {
+                budget_tokens: 32_000,
+                stream_thinking: false,
+            }),
+            _ => None, // "off", "none", or unrecognised → disabled
+        }
+    }
+
+    /// Return the named level string that best describes this config.
+    pub fn level_name(&self) -> &'static str {
+        if self.budget_tokens <= 2_000 {
+            "low"
+        } else if self.budget_tokens <= 15_000 {
+            "medium"
+        } else {
+            "high"
+        }
+    }
+}
+
 /// Programmatic Tool Calling (PTC) configuration.
 ///
 /// When enabled, agents receive a single `execute_code` tool instead of

@@ -49,6 +49,11 @@ struct ApiRequest {
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     stream: bool,
+    /// Extended thinking configuration.
+    /// When set, `temperature` must be 1 (enforced below).
+    /// Requires the `interleaved-thinking-2025-05-14` beta header.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    thinking: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,14 +193,23 @@ impl LlmDriver for AnthropicDriver {
             })
             .collect();
 
+        let thinking_param = request.thinking.as_ref().map(|t| {
+            serde_json::json!({"type": "enabled", "budget_tokens": t.budget_tokens})
+        });
         let api_request = ApiRequest {
             model: request.model.clone(),
             max_tokens: request.max_tokens,
             system,
             messages: api_messages,
             tools: api_tools,
-            temperature: Some(request.temperature),
+            // Anthropic requires temperature = 1 when extended thinking is enabled.
+            temperature: if request.thinking.is_some() {
+                Some(1.0)
+            } else {
+                Some(request.temperature)
+            },
             stream: false,
+            thinking: thinking_param,
         };
 
         // Retry loop for rate limits and overloads
@@ -204,12 +218,20 @@ impl LlmDriver for AnthropicDriver {
             let url = format!("{}/v1/messages", self.base_url);
             debug!(url = %url, attempt, "Sending Anthropic API request");
 
-            let resp = self
+            let mut req_builder = self
                 .client
                 .post(&url)
                 .header("x-api-key", self.api_key.as_str())
                 .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
+                .header("content-type", "application/json");
+
+            // Extended thinking requires the interleaved-thinking beta.
+            if request.thinking.is_some() {
+                req_builder = req_builder
+                    .header("anthropic-beta", "interleaved-thinking-2025-05-14");
+            }
+
+            let resp = req_builder
                 .json(&api_request)
                 .send()
                 .await
@@ -295,14 +317,23 @@ impl LlmDriver for AnthropicDriver {
             })
             .collect();
 
+        let thinking_param = request.thinking.as_ref().map(|t| {
+            serde_json::json!({"type": "enabled", "budget_tokens": t.budget_tokens})
+        });
         let api_request = ApiRequest {
             model: request.model.clone(),
             max_tokens: request.max_tokens,
             system,
             messages: api_messages,
             tools: api_tools,
-            temperature: Some(request.temperature),
+            // Anthropic requires temperature = 1 when extended thinking is enabled.
+            temperature: if request.thinking.is_some() {
+                Some(1.0)
+            } else {
+                Some(request.temperature)
+            },
             stream: true,
+            thinking: thinking_param,
         };
 
         // Retry loop for the initial HTTP request
@@ -311,12 +342,20 @@ impl LlmDriver for AnthropicDriver {
             let url = format!("{}/v1/messages", self.base_url);
             debug!(url = %url, attempt, "Sending Anthropic streaming request");
 
-            let resp = self
+            let mut req_builder = self
                 .client
                 .post(&url)
                 .header("x-api-key", self.api_key.as_str())
                 .header("anthropic-version", "2023-06-01")
-                .header("content-type", "application/json")
+                .header("content-type", "application/json");
+
+            // Extended thinking requires the interleaved-thinking beta.
+            if request.thinking.is_some() {
+                req_builder = req_builder
+                    .header("anthropic-beta", "interleaved-thinking-2025-05-14");
+            }
+
+            let resp = req_builder
                 .json(&api_request)
                 .send()
                 .await

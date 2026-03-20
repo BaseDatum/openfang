@@ -198,6 +198,24 @@ impl AgentRegistry {
         Ok(())
     }
 
+    /// Update an agent's extended thinking configuration.
+    ///
+    /// Pass `None` to disable thinking, or `Some(ThinkingConfig)` to enable it
+    /// with the specified token budget.
+    pub fn update_thinking(
+        &self,
+        id: AgentId,
+        thinking: Option<openfang_types::config::ThinkingConfig>,
+    ) -> OpenFangResult<()> {
+        let mut entry = self
+            .agents
+            .get_mut(&id)
+            .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
+        entry.manifest.model.thinking = thinking;
+        entry.last_active = chrono::Utc::now();
+        Ok(())
+    }
+
     /// Update an agent's fallback model chain.
     pub fn update_fallback_models(
         &self,

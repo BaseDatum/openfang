@@ -199,6 +199,10 @@ pub async fn build_router(
             axum::routing::put(routes::set_model),
         )
         .route(
+            "/api/agents/{id}/thinking",
+            axum::routing::patch(routes::set_agent_thinking),
+        )
+        .route(
             "/api/agents/{id}/tools",
             axum::routing::get(routes::get_agent_tools).put(routes::set_agent_tools),
         )

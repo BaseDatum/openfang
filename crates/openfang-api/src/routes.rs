@@ -212,6 +212,10 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
             let ready = matches!(e.state, openfang_types::agent::AgentState::Running)
                 && auth_status != "missing";
 
+            let thinking_level = match &e.manifest.model.thinking {
+                None => "off",
+                Some(t) => t.level_name(),
+            };
             serde_json::json!({
                 "id": e.id.to_string(),
                 "name": e.name,
@@ -225,6 +229,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 "auth_status": auth_status,
                 "ready": ready,
                 "profile": e.manifest.profile,
+                "thinking_level": thinking_level,
                 "identity": {
                     "emoji": e.identity.emoji,
                     "avatar_url": e.identity.avatar_url,
@@ -7009,6 +7014,59 @@ pub async fn set_model(
                 Json(
                     serde_json::json!({"status": "ok", "model": resolved_model, "provider": resolved_provider}),
                 ),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// PATCH /api/agents/{id}/thinking — Set extended thinking level for an agent.
+///
+/// Body: `{"thinking_level": "off" | "low" | "medium" | "high"}`
+///
+/// Levels map to `budget_tokens`:
+/// - `"off"` / `"none"` → disabled (None)
+/// - `"low"` → 1 500 tokens
+/// - `"medium"` → 10 000 tokens
+/// - `"high"` → 32 000 tokens
+pub async fn set_agent_thinking(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+
+    let level = body["thinking_level"].as_str().unwrap_or("off");
+    let thinking = openfang_types::config::ThinkingConfig::from_level(level);
+
+    match state.kernel.set_agent_thinking(agent_id, thinking) {
+        Ok(()) => {
+            let resolved_level = state
+                .kernel
+                .registry
+                .get(agent_id)
+                .map(|e| match &e.manifest.model.thinking {
+                    None => "off",
+                    Some(t) => t.level_name(),
+                })
+                .unwrap_or("off");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "thinking_level": resolved_level,
+                })),
             )
         }
         Err(e) => (

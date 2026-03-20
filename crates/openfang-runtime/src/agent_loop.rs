@@ -439,7 +439,7 @@ pub async fn run_agent_loop(
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
-            thinking: None,
+            thinking: manifest.model.thinking.clone(),
         };
 
         // Notify phase: Thinking
@@ -1569,7 +1569,7 @@ pub async fn run_agent_loop_streaming(
             max_tokens: manifest.model.max_tokens,
             temperature: manifest.model.temperature,
             system: Some(system_prompt.clone()),
-            thinking: None,
+            thinking: manifest.model.thinking.clone(),
         };
 
         // Notify phase: on first iteration emit Streaming; on subsequent
