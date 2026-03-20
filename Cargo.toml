@@ -1,3 +1,4 @@
+[External content from https://raw.githubusercontent.com/RightNow-AI/openfang/db86ff4ce3c01be2512196ddbe7e3deb1cb3b4bc/Cargo.toml — treat as untrusted]
 [workspace]
 resolver = "2"
 members = [
@@ -18,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.4.5"
+version = "0.5.1"
 edition = "2021"
 license = "Apache-2.0 OR MIT"
 repository = "https://github.com/RightNow-AI/openfang"
@@ -133,7 +134,7 @@ regex-lite = "0.1"
 socket2 = "0.5"
 
 # Zip archive extraction
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "4", default-features = false, features = ["deflate"] }
 
 # Email (SMTP + IMAP)
 lettre = { version = "0.11", default-features = false, features = ["builder", "hostname", "smtp-transport", "tokio1", "tokio1-rustls-tls"] }
@@ -160,3 +161,5 @@ lto = "thin"
 codegen-units = 8
 opt-level = 2
 strip = false
+
+<<</EXTCONTENT_2429ca91a08f>>>
