@@ -161,6 +161,13 @@ pub struct OpenFangKernel {
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
+    /// Pending client-side tool calls awaiting results from the connected client.
+    /// Key: call_id, Value: oneshot sender for (content, is_error).
+    pub client_tool_pending:
+        dashmap::DashMap<String, tokio::sync::oneshot::Sender<(String, bool)>>,
+    /// Broadcast channel for outbound client tool calls. The WS handler subscribes
+    /// to this and forwards calls to the connected client.
+    pub client_tool_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -1049,6 +1056,8 @@ impl OpenFangKernel {
             default_model_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
+            client_tool_pending: dashmap::DashMap::new(),
+            client_tool_tx: tokio::sync::broadcast::channel(32).0,
         };
 
         // Restore persisted agents from SQLite
@@ -4770,7 +4779,21 @@ impl OpenFangKernel {
     /// the boot-time snapshot). This helper checks both sources so that custom
     /// providers work immediately without a daemon restart.
     /// Resolve a credential by env var name using the vault → dotenv → env var chain.
-    pub fn resolve_credential(&self, key: &str) -> Option<String> {
+    /// Resolve a pending client tool call with the result from the connected client.
+    /// Called by the WS handler when it receives a `client_tool_result` message.
+    ///
+    /// Returns `true` if the call_id was found and resolved, `false` if no pending
+    /// call matched (stale result or duplicate).
+    pub fn resolve_client_tool(&self, call_id: &str, content: String, is_error: bool) -> bool {
+        if let Some((_, tx)) = self.client_tool_pending.remove(call_id) {
+            let _ = tx.send((content, is_error));
+            true
+        } else {
+            false
+        }
+    }
+
+     pub fn resolve_credential(&self, key: &str) -> Option<String> {
         self.credential_resolver
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -5616,6 +5639,21 @@ impl OpenFangKernel {
             }
         }
         context_parts.join("\n\n")
+    }
+
+    /// Resolve an agent identifier (UUID string or human-readable name) to
+    /// `(AgentId, name)`. Returns `None` if the agent is not registered.
+    fn resolve_agent_id_and_name(&self, agent_id: &str) -> Option<(AgentId, String)> {
+        // Try UUID first
+        if let Ok(id) = agent_id.parse::<AgentId>() {
+            if let Some(entry) = self.registry.get(id) {
+                return Some((id, entry.name.clone()));
+            }
+        }
+        // Fall back to name lookup
+        self.registry
+            .find_by_name(agent_id)
+            .map(|entry| (entry.id, entry.name.clone()))
     }
 }
 
@@ -6630,6 +6668,301 @@ impl KernelHandle for OpenFangKernel {
 
         // Delegate to the normal spawn path (use trait method via KernelHandle::)
         KernelHandle::spawn_agent(self, manifest_toml, parent_id).await
+    }
+
+    // -----------------------------------------------------------------
+    // Cross-agent context search (Issue #13)
+    // -----------------------------------------------------------------
+
+    async fn get_agent_context(
+        &self,
+        agent_id: &str,
+        max_messages: usize,
+        time_window_minutes: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        // Resolve agent by UUID or name
+        let (aid, agent_name) = self
+            .resolve_agent_id_and_name(agent_id)
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+
+        // Cap to prevent unbounded reads
+        let limit = max_messages.min(100);
+
+        let (summary, messages) = self
+            .memory
+            .canonical_context(aid, Some(limit))
+            .map_err(|e| format!("Failed to load context: {e}"))?;
+
+        // Build the time cutoff if a window is specified
+        let cutoff = time_window_minutes.map(|mins| {
+            chrono::Utc::now() - chrono::Duration::minutes(mins.min(1440) as i64)
+        });
+
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        // Include the compacted summary if present
+        if let Some(ref s) = summary {
+            results.push(serde_json::json!({
+                "agent_id": aid.to_string(),
+                "agent_name": &agent_name,
+                "source": "summary",
+                "role": "system",
+                "content": openfang_types::truncate_str(s, 2000),
+            }));
+        }
+
+        // Add recent messages (reverse order — newest first for time-window filtering,
+        // then re-reverse to return chronological order)
+        for msg in &messages {
+            let role = match msg.role {
+                openfang_types::message::Role::User => "user",
+                openfang_types::message::Role::Assistant => "assistant",
+                openfang_types::message::Role::System => "system",
+            };
+            let text = msg.content.text_content();
+            if text.is_empty() {
+                continue;
+            }
+            results.push(serde_json::json!({
+                "agent_id": aid.to_string(),
+                "agent_name": &agent_name,
+                "source": "context",
+                "role": role,
+                "content": openfang_types::truncate_str(&text, 500),
+            }));
+        }
+
+        // If there's a time cutoff, we can't filter individual messages by timestamp
+        // (Message struct has no timestamp), but we can limit to the most recent N.
+        // The canonical_context already returns the most recent `limit` messages.
+        // For time-window, we use the semantic memory as a time-aware supplement.
+        if let Some(cutoff_dt) = cutoff {
+            // Supplement with semantic memories that have timestamps
+            let filter = openfang_types::memory::MemoryFilter {
+                agent_id: Some(aid),
+                after: Some(cutoff_dt),
+                ..Default::default()
+            };
+            if let Ok(memories) = self.memory.recall("", 10, Some(filter)).await {
+                for mem in memories {
+                    results.push(serde_json::json!({
+                        "agent_id": aid.to_string(),
+                        "agent_name": &agent_name,
+                        "source": "memory",
+                        "role": "memory",
+                        "content": openfang_types::truncate_str(&mem.content, 500),
+                        "timestamp": mem.created_at.to_rfc3339(),
+                    }));
+                }
+            }
+        }
+
+        // Cap total response size
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    async fn search_agent_context(
+        &self,
+        agent_id: &str,
+        query: &str,
+        max_results: usize,
+        time_window_minutes: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        // Security: cap limits
+        let limit = max_results.min(50);
+        let query_lower = query.to_lowercase();
+
+        let cutoff = time_window_minutes.map(|mins| {
+            chrono::Utc::now() - chrono::Duration::minutes(mins.min(1440) as i64)
+        });
+
+        // Determine which agents to search
+        let agents_to_search: Vec<(AgentId, String)> = if agent_id == "all" {
+            self.registry
+                .list()
+                .into_iter()
+                .map(|e| (e.id, e.name.clone()))
+                .collect()
+        } else {
+            let (aid, name) = self
+                .resolve_agent_id_and_name(agent_id)
+                .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+            vec![(aid, name)]
+        };
+
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        // Phase 1: Search canonical session messages (keyword match)
+        for (aid, agent_name) in &agents_to_search {
+            // Load recent context (up to 100 messages per agent to keep it bounded)
+            let window_size = if agent_id == "all" { 50 } else { 100 };
+            let (summary, messages) = self
+                .memory
+                .canonical_context(*aid, Some(window_size))
+                .map_err(|e| format!("Failed to load context for {agent_name}: {e}"))?;
+
+            // Search the compacted summary
+            if let Some(ref s) = summary {
+                if s.to_lowercase().contains(&query_lower) {
+                    results.push(serde_json::json!({
+                        "agent_id": aid.to_string(),
+                        "agent_name": agent_name,
+                        "source": "summary",
+                        "role": "system",
+                        "content": openfang_types::truncate_str(s, 500),
+                        "relevance": "keyword_match",
+                    }));
+                }
+            }
+
+            // Search individual messages
+            for msg in &messages {
+                let text = msg.content.text_content();
+                if text.is_empty() {
+                    continue;
+                }
+                if text.to_lowercase().contains(&query_lower) {
+                    let role = match msg.role {
+                        openfang_types::message::Role::User => "user",
+                        openfang_types::message::Role::Assistant => "assistant",
+                        openfang_types::message::Role::System => "system",
+                    };
+                    results.push(serde_json::json!({
+                        "agent_id": aid.to_string(),
+                        "agent_name": agent_name,
+                        "source": "context",
+                        "role": role,
+                        "content": openfang_types::truncate_str(&text, 500),
+                        "relevance": "keyword_match",
+                    }));
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+
+            if results.len() >= limit {
+                break;
+            }
+        }
+
+        // Phase 1: Also search semantic memories (these have timestamps)
+        if results.len() < limit {
+            for (aid, agent_name) in &agents_to_search {
+                let remaining = limit.saturating_sub(results.len());
+                if remaining == 0 {
+                    break;
+                }
+                let filter = openfang_types::memory::MemoryFilter {
+                    agent_id: Some(*aid),
+                    after: cutoff,
+                    ..Default::default()
+                };
+                if let Ok(memories) = self.memory.recall(query, remaining, Some(filter)).await {
+                    for mem in memories {
+                        results.push(serde_json::json!({
+                            "agent_id": aid.to_string(),
+                            "agent_name": agent_name,
+                            "source": "memory",
+                            "role": "memory",
+                            "content": openfang_types::truncate_str(&mem.content, 500),
+                            "timestamp": mem.created_at.to_rfc3339(),
+                            "relevance": "semantic_recall",
+                        }));
+                    }
+                }
+            }
+        }
+
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    async fn execute_client_tool(
+        &self,
+        tool_name: &str,
+        tool_use_id: &str,
+        input: &serde_json::Value,
+    ) -> Result<String, String> {
+        use tokio::sync::oneshot;
+
+        let call_id = format!("ct_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]);
+
+        let (tx, rx) = oneshot::channel::<(String, bool)>();
+        self.client_tool_pending.insert(call_id.clone(), tx);
+
+        // Broadcast the tool call to the WS handler. The WS handler
+        // subscribes to client_tool_tx and forwards calls to the client.
+        let _ = self.client_tool_tx.send(serde_json::json!({
+            "type": "client_tool_call",
+            "call_id": call_id,
+            "tool": tool_name,
+            "tool_use_id": tool_use_id,
+            "input": input,
+        }));
+
+        // Wait for the result with a timeout
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok((content, is_error))) => {
+                if is_error {
+                    Err(content)
+                } else {
+                    Ok(content)
+                }
+            }
+            Ok(Err(_)) => {
+                self.client_tool_pending.remove(&call_id);
+                Err("Client tool call was cancelled".to_string())
+            }
+            Err(_) => {
+                self.client_tool_pending.remove(&call_id);
+                Err("Client tool call timed out (30s) — is the client connected?".to_string())
+            }
+        }
+    }
+
+    fn list_active_agents_with_context(&self) -> Vec<serde_json::Value> {
+        let agents = self.registry.list();
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        for entry in &agents {
+            // Get a brief context summary: message count from canonical session
+            let (msg_count, last_preview) = self
+                .memory
+                .canonical_context(entry.id, Some(1))
+                .map(|(_, msgs)| {
+                    let preview = msgs
+                        .first()
+                        .map(|m| {
+                            openfang_types::truncate_str(&m.content.text_content(), 200)
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    // For total count, load full context (capped) to get the count
+                    let total = self
+                        .memory
+                        .canonical_context(entry.id, Some(500))
+                        .map(|(_, all)| all.len())
+                        .unwrap_or(0);
+                    (total, preview)
+                })
+                .unwrap_or((0, String::new()));
+
+            results.push(serde_json::json!({
+                "id": entry.id.to_string(),
+                "name": &entry.name,
+                "state": format!("{:?}", entry.state),
+                "description": openfang_types::truncate_str(&entry.manifest.description, 200),
+                "last_active": entry.last_active.to_rfc3339(),
+                "message_count": msg_count,
+                "last_message_preview": last_preview,
+                "model": format!("{}:{}", entry.manifest.model.provider, entry.manifest.model.model),
+                "tags": &entry.tags,
+            }));
+        }
+
+        results
     }
 }
 

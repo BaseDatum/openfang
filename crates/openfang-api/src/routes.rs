@@ -11403,6 +11403,85 @@ fn remove_toml_section(content: &str, section: &str) -> String {
     result
 }
 
+// ---------------------------------------------------------------------------
+// Cross-agent context search (Issue #13)
+// ---------------------------------------------------------------------------
+
+/// GET /api/context/search?query=...&agent_id=all&max_results=5&time_window_minutes=30
+///
+/// Search across agent context windows and memories with a text query.
+pub async fn context_search(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ContextSearchQuery>,
+) -> impl IntoResponse {
+    let kernel: &Arc<OpenFangKernel> = &state.kernel;
+    match kernel
+        .search_agent_context(
+            &params.agent_id,
+            &params.query,
+            params.max_results.min(50),
+            params.time_window_minutes,
+        )
+        .await
+    {
+        Ok(results) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "query": params.query,
+                "agent_id": params.agent_id,
+                "results": results,
+                "count": results.len(),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+/// GET /api/agents/:id/context?max_messages=10&time_window_minutes=30
+///
+/// Get recent conversation context from a specific agent's session.
+pub async fn get_agent_context(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<ContextGetQuery>,
+) -> impl IntoResponse {
+    let kernel: &Arc<OpenFangKernel> = &state.kernel;
+    match kernel
+        .get_agent_context(
+            &id,
+            params.max_messages.min(100),
+            params.time_window_minutes,
+        )
+        .await
+    {
+        Ok(results) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "agent_id": id,
+                "messages": results,
+                "count": results.len(),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+/// GET /api/context/agents — List active agents with context summaries.
+pub async fn context_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let kernel: &Arc<OpenFangKernel> = &state.kernel;
+    let agents = kernel.list_active_agents_with_context();
+    Json(serde_json::json!({
+        "agents": agents,
+        "count": agents.len(),
+    }))
+}
+
 #[cfg(test)]
 mod channel_config_tests {
     use super::*;

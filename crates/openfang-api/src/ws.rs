@@ -299,6 +299,11 @@ async fn handle_agent_ws(
     // Track last activity for idle timeout
     let mut last_activity = std::time::Instant::now();
 
+    // Subscribe to client tool call broadcasts from the kernel.
+    // When an agent calls a client-side tool, the kernel broadcasts it
+    // and we forward it to the connected client over this WS.
+    let mut client_tool_rx = state.kernel.client_tool_tx.subscribe();
+
     // Track whether a "message" type request is being processed.
     // This prevents concurrent agent invocations from the same connection
     // and allows the receive loop to stay responsive for Ping/Pong frames.
@@ -321,6 +326,13 @@ async fn handle_agent_ws(
                     Some(m) => m,
                     None => break, // Stream ended
                 }
+            }
+            // Forward client tool calls from the kernel to the connected client.
+            tool_call = client_tool_rx.recv() => {
+                if let Ok(payload) = tool_call {
+                    let _ = send_json(&sender, &payload).await;
+                }
+                continue; // Not a WS message — go back to waiting
             }
             _ = tokio::time::sleep(WS_IDLE_TIMEOUT.saturating_sub(last_activity.elapsed())) => {
                 info!(agent_id = %id_str, "WebSocket idle timeout (30 min)");
@@ -392,6 +404,29 @@ async fn handle_agent_ws(
                             &serde_json::json!({"type": "pong"}),
                         )
                         .await;
+                    }
+                    // Fast path: client tool results from the macOS/iOS app.
+                    // Route back to the kernel's pending call map.
+                    "client_tool_result" => {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let (Some(call_id), Some(result), Some(is_error)) = (
+                                parsed["call_id"].as_str(),
+                                parsed["result"].as_str(),
+                                parsed["is_error"].as_bool(),
+                            ) {
+                                let resolved = state.kernel.resolve_client_tool(
+                                    call_id,
+                                    result.to_string(),
+                                    is_error,
+                                );
+                                if !resolved {
+                                    tracing::warn!(
+                                        call_id,
+                                        "Received client_tool_result for unknown call_id"
+                                    );
+                                }
+                            }
+                        }
                     }
                     // Commands (/stop, /model, /compact, etc.) run inline.
                     // This is intentional: /stop must work while the agent is
@@ -1145,6 +1180,16 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
             "type": "phase",
             "phase": phase,
             "detail": detail,
+        })),
+        StreamEvent::ClientToolCall {
+            call_id,
+            tool_name,
+            input,
+        } => Some(serde_json::json!({
+            "type": "client_tool_call",
+            "call_id": call_id,
+            "tool": tool_name,
+            "input": input,
         })),
         _ => None, // Skip ToolInputDelta, ContentComplete
     }

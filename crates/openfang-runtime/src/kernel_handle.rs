@@ -264,4 +264,62 @@ pub trait KernelHandle: Send + Sync {
         let _ = parent_caps;
         self.spawn_agent(manifest_toml, parent_id).await
     }
+
+    // -----------------------------------------------------------------
+    // Cross-agent context search (Issue #13)
+    // -----------------------------------------------------------------
+
+    /// Get recent context (conversation history) from an agent's canonical session.
+    /// Returns timestamped messages as JSON objects.
+    /// `time_window_minutes` optionally filters to only messages within that window.
+    async fn get_agent_context(
+        &self,
+        agent_id: &str,
+        max_messages: usize,
+        time_window_minutes: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let _ = (agent_id, max_messages, time_window_minutes);
+        Err("Context search not available".to_string())
+    }
+
+    /// Search across agent context windows and semantic memories.
+    /// If `agent_id` is "all", searches all agents. Otherwise, searches a specific agent.
+    /// Uses keyword matching (Phase 1) with optional time window filter.
+    async fn search_agent_context(
+        &self,
+        agent_id: &str,
+        query: &str,
+        max_results: usize,
+        time_window_minutes: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let _ = (agent_id, query, max_results, time_window_minutes);
+        Err("Context search not available".to_string())
+    }
+
+    /// List active agents with lightweight context summaries (message count,
+    /// last activity timestamp, last message preview).
+    fn list_active_agents_with_context(&self) -> Vec<serde_json::Value> {
+        vec![]
+    }
+
+    // -----------------------------------------------------------------
+    // Client-side tool execution (meeting control tools)
+    // -----------------------------------------------------------------
+
+    /// Execute a client-side tool by forwarding it to the connected client
+    /// (macOS/iOS app) via WebSocket.
+    ///
+    /// The kernel implementation sends a `client_tool_call` event over the
+    /// WS and waits for a `client_tool_result` response from the client.
+    ///
+    /// Returns the tool result content on success, or an error string.
+    async fn execute_client_tool(
+        &self,
+        tool_name: &str,
+        tool_use_id: &str,
+        input: &serde_json::Value,
+    ) -> Result<String, String> {
+        let _ = (tool_name, tool_use_id, input);
+        Err("Client tool execution not available (no connected client)".to_string())
+    }
 }

@@ -277,6 +277,19 @@ pub async fn build_router(
             "/api/templates/{name}",
             axum::routing::get(routes::get_template),
         )
+        // Cross-agent context search endpoints
+        .route(
+            "/api/context/search",
+            axum::routing::get(routes::context_search),
+        )
+        .route(
+            "/api/context/agents",
+            axum::routing::get(routes::context_agents),
+        )
+        .route(
+            "/api/agents/{id}/context",
+            axum::routing::get(routes::get_agent_context),
+        )
         // Memory endpoints
         .route(
             "/api/memory/agents/{id}/kv",

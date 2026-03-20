@@ -470,11 +470,11 @@ impl LlmDriver for OpenAIDriver {
             thinking: if self.needs_reasoning_content(&request.model) {
                 // Disable thinking for Kimi to avoid multi-turn reasoning_content issues.
                 Some(serde_json::json!({"type": "disabled"}))
-            } else if let Some(ref t) = request.thinking {
-                // Enable extended thinking (Claude via OpenRouter or direct Anthropic).
-                Some(serde_json::json!({"type": "enabled", "budget_tokens": t.budget_tokens}))
             } else {
-                None
+                request.thinking.as_ref().map(|t| {
+                    // Enable extended thinking (Claude via OpenRouter or direct Anthropic).
+                    serde_json::json!({"type": "enabled", "budget_tokens": t.budget_tokens})
+                })
             },
         };
 
@@ -932,11 +932,11 @@ impl LlmDriver for OpenAIDriver {
             thinking: if self.needs_reasoning_content(&request.model) {
                 // Disable thinking for Kimi to avoid multi-turn reasoning_content issues.
                 Some(serde_json::json!({"type": "disabled"}))
-            } else if let Some(ref t) = request.thinking {
-                // Enable extended thinking (Claude via OpenRouter or direct Anthropic).
-                Some(serde_json::json!({"type": "enabled", "budget_tokens": t.budget_tokens}))
             } else {
-                None
+                request.thinking.as_ref().map(|t| {
+                    // Enable extended thinking (Claude via OpenRouter or direct Anthropic).
+                    serde_json::json!({"type": "enabled", "budget_tokens": t.budget_tokens})
+                })
             },
         };
 
