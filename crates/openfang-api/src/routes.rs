@@ -5738,6 +5738,7 @@ pub async fn patch_agent(
         if let Err(e) = state
             .kernel
             .set_agent_model(agent_id, model, explicit_provider)
+            .await
         {
             return (
                 StatusCode::BAD_REQUEST,
@@ -6993,6 +6994,7 @@ pub async fn set_model(
     match state
         .kernel
         .set_agent_model(agent_id, model, explicit_provider)
+        .await
     {
         Ok(()) => {
             // Return the resolved model+provider so frontend stays in sync.
@@ -7050,7 +7052,7 @@ pub async fn set_agent_thinking(
     let level = body["thinking_level"].as_str().unwrap_or("off");
     let thinking = openfang_types::config::ThinkingConfig::from_level(level);
 
-    match state.kernel.set_agent_thinking(agent_id, thinking) {
+    match state.kernel.set_agent_thinking(agent_id, thinking).await {
         Ok(()) => {
             let resolved_level = state
                 .kernel
@@ -7150,6 +7152,7 @@ pub async fn set_agent_tools(
     match state
         .kernel
         .set_agent_tool_filters(agent_id, allowlist, blocklist)
+        .await
     {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
         Err(e) => (
@@ -7228,7 +7231,7 @@ pub async fn set_agent_skills(
                 .collect()
         })
         .unwrap_or_default();
-    match state.kernel.set_agent_skills(agent_id, skills.clone()) {
+    match state.kernel.set_agent_skills(agent_id, skills.clone()).await {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "skills": skills})),
@@ -7316,6 +7319,7 @@ pub async fn set_agent_mcp_servers(
     match state
         .kernel
         .set_agent_mcp_servers(agent_id, servers.clone())
+        .await
     {
         Ok(()) => (
             StatusCode::OK,
@@ -8910,6 +8914,7 @@ pub async fn patch_agent_config(
                         state
                             .kernel
                             .set_agent_model(agent_id, new_model, Some(new_provider))
+                            .await
                     {
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -8918,7 +8923,7 @@ pub async fn patch_agent_config(
                     }
                 } else {
                     // Provider is empty string — resolve from catalog
-                    if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None) {
+                    if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None).await {
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({"error": format!("{e}")})),
@@ -8927,7 +8932,7 @@ pub async fn patch_agent_config(
                 }
             } else {
                 // No provider field at all — resolve from catalog
-                if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None) {
+                if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None).await {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": format!("{e}")})),

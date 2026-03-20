@@ -88,6 +88,16 @@ impl MemorySubstrate {
         self.structured.save_agent(entry)
     }
 
+    /// Save an agent entry asynchronously — runs the SQLite write in a blocking
+    /// thread so the tokio runtime stays responsive.
+    pub async fn save_agent_async(&self, entry: &AgentEntry) -> OpenFangResult<()> {
+        let structured = self.structured.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || structured.save_agent(&entry))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
     /// Load an agent entry from persistent storage.
     pub fn load_agent(&self, agent_id: AgentId) -> OpenFangResult<Option<AgentEntry>> {
         self.structured.load_agent(agent_id)
@@ -144,6 +154,15 @@ impl MemorySubstrate {
         self.sessions.get_session(session_id)
     }
 
+    /// Get a session by ID asynchronously — runs the SQLite read in a blocking
+    /// thread so the tokio runtime stays responsive.
+    pub async fn get_session_async(&self, session_id: SessionId) -> OpenFangResult<Option<Session>> {
+        let sessions = self.sessions.clone();
+        tokio::task::spawn_blocking(move || sessions.get_session(session_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
     /// Save a session.
     pub fn save_session(&self, session: &Session) -> OpenFangResult<()> {
         self.sessions.save_session(session)
@@ -182,6 +201,15 @@ impl MemorySubstrate {
     /// Delete the canonical (cross-channel) session for an agent.
     pub fn delete_canonical_session(&self, agent_id: AgentId) -> OpenFangResult<()> {
         self.sessions.delete_canonical_session(agent_id)
+    }
+
+    /// Delete the canonical session asynchronously — runs the SQLite write in a
+    /// blocking thread so the tokio runtime stays responsive.
+    pub async fn delete_canonical_session_async(&self, agent_id: AgentId) -> OpenFangResult<()> {
+        let sessions = self.sessions.clone();
+        tokio::task::spawn_blocking(move || sessions.delete_canonical_session(agent_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
     /// Set or clear a session label.
@@ -240,6 +268,21 @@ impl MemorySubstrate {
     ) -> OpenFangResult<()> {
         self.sessions
             .store_llm_summary(agent_id, summary, kept_messages)
+    }
+
+    /// Store an LLM-generated summary asynchronously — runs the SQLite write in
+    /// a blocking thread so the tokio runtime stays responsive.
+    pub async fn store_llm_summary_async(
+        &self,
+        agent_id: AgentId,
+        summary: &str,
+        kept_messages: Vec<openfang_types::message::Message>,
+    ) -> OpenFangResult<()> {
+        let sessions = self.sessions.clone();
+        let summary = summary.to_string();
+        tokio::task::spawn_blocking(move || sessions.store_llm_summary(agent_id, &summary, kept_messages))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
     /// Write a human-readable JSONL mirror of a session to disk.

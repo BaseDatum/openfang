@@ -2984,7 +2984,7 @@ impl OpenFangKernel {
     /// Agents with a custom `base_url` keep their current provider unless
     /// overridden explicitly — this prevents custom setups (e.g. Tencent,
     /// Azure, or other third-party endpoints) from being misidentified.
-    pub fn set_agent_model(
+    pub async fn set_agent_model(
         &self,
         agent_id: AgentId,
         model: &str,
@@ -3051,13 +3051,14 @@ impl OpenFangKernel {
             info!(agent_id = %agent_id, model = %normalized_model, "Agent model updated (provider unchanged)");
         }
 
-        // Persist the updated entry
+        // Persist the updated entry — use async to avoid blocking the tokio
+        // runtime while waiting for the shared SQLite mutex.
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            let _ = self.memory.save_agent_async(&entry).await;
         }
 
         // Clear canonical session to prevent memory poisoning from old model's responses
-        let _ = self.memory.delete_canonical_session(agent_id);
+        let _ = self.memory.delete_canonical_session_async(agent_id).await;
         debug!(agent_id = %agent_id, "Cleared canonical session after model switch");
 
         Ok(())
@@ -3070,7 +3071,7 @@ impl OpenFangKernel {
     ///
     /// The change is persisted to storage immediately and takes effect on the
     /// next LLM call.
-    pub fn set_agent_thinking(
+    pub async fn set_agent_thinking(
         &self,
         agent_id: AgentId,
         thinking: Option<openfang_types::config::ThinkingConfig>,
@@ -3079,14 +3080,14 @@ impl OpenFangKernel {
             .update_thinking(agent_id, thinking)
             .map_err(KernelError::OpenFang)?;
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            let _ = self.memory.save_agent_async(&entry).await;
         }
         info!(agent_id = %agent_id, "Agent thinking config updated");
         Ok(())
     }
 
     /// Update an agent's skill allowlist. Empty = all skills (backward compat).
-    pub fn set_agent_skills(&self, agent_id: AgentId, skills: Vec<String>) -> KernelResult<()> {
+    pub async fn set_agent_skills(&self, agent_id: AgentId, skills: Vec<String>) -> KernelResult<()> {
         // Validate skill names if allowlist is non-empty
         if !skills.is_empty() {
             let registry = self
@@ -3108,7 +3109,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            let _ = self.memory.save_agent_async(&entry).await;
         }
 
         info!(agent_id = %agent_id, skills = ?skills, "Agent skills updated");
@@ -3116,7 +3117,7 @@ impl OpenFangKernel {
     }
 
     /// Update an agent's MCP server allowlist. Empty = all servers (backward compat).
-    pub fn set_agent_mcp_servers(
+    pub async fn set_agent_mcp_servers(
         &self,
         agent_id: AgentId,
         servers: Vec<String>,
@@ -3147,7 +3148,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            let _ = self.memory.save_agent_async(&entry).await;
         }
 
         info!(agent_id = %agent_id, servers = ?servers, "Agent MCP servers updated");
@@ -3155,7 +3156,7 @@ impl OpenFangKernel {
     }
 
     /// Update an agent's tool allowlist and/or blocklist.
-    pub fn set_agent_tool_filters(
+    pub async fn set_agent_tool_filters(
         &self,
         agent_id: AgentId,
         allowlist: Option<Vec<String>>,
@@ -3166,7 +3167,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            let _ = self.memory.save_agent_async(&entry).await;
         }
 
         info!(
@@ -3242,7 +3243,8 @@ impl OpenFangKernel {
 
         let session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session_async(entry.session_id)
+            .await
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
                 id: entry.session_id,
@@ -3269,20 +3271,24 @@ impl OpenFangKernel {
             .await
             .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e)))?;
 
-        // Store the LLM summary in the canonical session
+        // Store the LLM summary in the canonical session — use async to avoid
+        // blocking the tokio runtime while waiting for the shared SQLite mutex.
         self.memory
-            .store_llm_summary(agent_id, &result.summary, result.kept_messages.clone())
+            .store_llm_summary_async(agent_id, &result.summary, result.kept_messages.clone())
+            .await
             .map_err(KernelError::OpenFang)?;
 
         // Post-compaction audit: validate and repair the kept messages
         let (repaired_messages, repair_stats) =
             openfang_runtime::session_repair::validate_and_repair_with_stats(&result.kept_messages);
 
-        // Also update the regular session with the repaired messages
+        // Also update the regular session with the repaired messages — use
+        // async to avoid blocking the tokio runtime during the heavy write.
         let mut updated_session = session;
         updated_session.messages = repaired_messages;
         self.memory
-            .save_session(&updated_session)
+            .save_session_async(&updated_session)
+            .await
             .map_err(KernelError::OpenFang)?;
 
         // Build result message with audit summary

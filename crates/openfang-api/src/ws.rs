@@ -921,7 +921,7 @@ async fn handle_command(
                     serde_json::json!({"type": "error", "content": "Agent not found"})
                 }
             } else {
-                match state.kernel.set_agent_model(agent_id, args, None) {
+                match state.kernel.set_agent_model(agent_id, args, None).await {
                     Ok(()) => {
                         if let Some(entry) = state.kernel.registry.get(agent_id) {
                             let model = &entry.manifest.model.model;

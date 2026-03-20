@@ -1160,7 +1160,8 @@ pub fn spawn_update_agent_skills(
         BackendRef::InProcess(kernel) => {
             if let Ok(uuid) = uuid::Uuid::parse_str(&agent_id) {
                 let aid = openfang_types::agent::AgentId(uuid);
-                match kernel.set_agent_skills(aid, skills) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                match rt.block_on(kernel.set_agent_skills(aid, skills)) {
                     Ok(()) => {
                         let _ = tx.send(AppEvent::AgentSkillsUpdated(agent_id));
                     }
@@ -1204,7 +1205,8 @@ pub fn spawn_update_agent_mcp_servers(
         BackendRef::InProcess(kernel) => {
             if let Ok(uuid) = uuid::Uuid::parse_str(&agent_id) {
                 let aid = openfang_types::agent::AgentId(uuid);
-                match kernel.set_agent_mcp_servers(aid, servers) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                match rt.block_on(kernel.set_agent_mcp_servers(aid, servers)) {
                     Ok(()) => {
                         let _ = tx.send(AppEvent::AgentMcpServersUpdated(agent_id));
                     }

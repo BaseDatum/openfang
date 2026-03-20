@@ -711,6 +711,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         }
         self.kernel
             .set_agent_model(agent_id, model, None)
+            .await
             .map_err(|e| format!("{e}"))?;
         // Read back resolved model+provider from registry
         let entry = self
