@@ -5194,7 +5194,8 @@ impl OpenFangKernel {
             // declared-tools filter to avoid flooding the context.
             let mcp_explicitly_opted_in = !mcp_allowlist.is_empty();
             for t in mcp_candidates {
-                if !tools_unrestricted && !mcp_explicitly_opted_in
+                if !tools_unrestricted
+                    && !mcp_explicitly_opted_in
                     && !declared_tools.iter().any(|d| d == &t.name)
                 {
                     continue;

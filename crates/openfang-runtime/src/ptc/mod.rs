@@ -84,9 +84,7 @@ impl PtcInstance {
 /// Starts the IPC server, classifies tools, generates the execute_code tool,
 /// and returns the PTC instance. The caller must poll `ptc_instance.ipc_server.request_rx`
 /// to dispatch tool calls from the IPC server.
-pub async fn init_ptc(
-    all_tools: &[ToolDefinition],
-) -> Result<PtcInstance, String> {
+pub async fn init_ptc(all_tools: &[ToolDefinition]) -> Result<PtcInstance, String> {
     // Check python3 availability first (cached after first call)
     if !is_python3_available() {
         return Err("python3 not available".to_string());
