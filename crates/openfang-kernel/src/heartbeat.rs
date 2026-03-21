@@ -149,12 +149,17 @@ pub fn check_agents(registry: &AgentRegistry, config: &HeartbeatConfig) -> Vec<H
 
         let inactive_secs = (now - entry_ref.last_active).num_seconds();
 
-        // Determine timeout: use agent's autonomous config if set, else default
+        // Determine timeout: use agent's autonomous config if set, else default.
+        // The timeout must be at least as long as the agent's max_tick_duration
+        // to avoid marking agents as unresponsive during long PTC/execute_code runs.
         let timeout_secs = entry_ref
             .manifest
             .autonomous
             .as_ref()
-            .map(|a| a.heartbeat_interval_secs * UNRESPONSIVE_MULTIPLIER)
+            .map(|a| {
+                let heartbeat_timeout = a.heartbeat_interval_secs * UNRESPONSIVE_MULTIPLIER;
+                heartbeat_timeout.max(a.max_tick_duration_secs)
+            })
             .unwrap_or(config.default_timeout_secs) as i64;
 
         // --- Skip idle agents that have never genuinely processed a message ---
