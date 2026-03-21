@@ -57,8 +57,15 @@ fn phantom_action_detected(text: &str) -> bool {
     let lower = text.to_lowercase();
     let action_verbs = ["sent ", "posted ", "emailed ", "delivered ", "forwarded "];
     let channel_refs = [
-        "telegram", "whatsapp", "slack", "discord", "email", "channel",
-        "message sent", "successfully sent", "has been sent",
+        "telegram",
+        "whatsapp",
+        "slack",
+        "discord",
+        "email",
+        "channel",
+        "message sent",
+        "successfully sent",
+        "has been sent",
     ];
     let has_action = action_verbs.iter().any(|v| lower.contains(v));
     let has_channel = channel_refs.iter().any(|c| lower.contains(c));
@@ -305,7 +312,9 @@ pub async fn run_agent_loop(
     // The LLM already received them via llm_messages above.
     for msg in session.messages.iter_mut() {
         if let MessageContent::Blocks(blocks) = &mut msg.content {
-            let had_images = blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
+            let had_images = blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. }));
             if had_images {
                 blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
                 if blocks.is_empty() {
@@ -520,7 +529,10 @@ pub async fn run_agent_loop(
                 // One-shot retry: if the LLM returns empty text with no tool use,
                 // try once more before accepting the empty result.
                 // Triggers on first call OR when input_tokens=0 (silently failed request).
-                if text.trim().is_empty() && response.tool_calls.is_empty() && !response.has_any_content() {
+                if text.trim().is_empty()
+                    && response.tool_calls.is_empty()
+                    && !response.has_any_content()
+                {
                     let is_silent_failure =
                         response.usage.input_tokens == 0 && response.usage.output_tokens == 0;
                     if iteration == 0 || is_silent_failure {
@@ -565,7 +577,10 @@ pub async fn run_agent_loop(
                 // channel action (send, post, email, etc.) but never actually
                 // called the corresponding tool, re-prompt once to force real
                 // tool usage instead of hallucinated completion.
-                let text = if !any_tools_executed && iteration == 0 && phantom_action_detected(&text) {
+                let text = if !any_tools_executed
+                    && iteration == 0
+                    && phantom_action_detected(&text)
+                {
                     warn!(agent = %manifest.name, "Phantom action detected — re-prompting for real tool use");
                     messages.push(Message::assistant(text));
                     messages.push(Message::user(
@@ -787,10 +802,9 @@ pub async fn run_agent_loop(
                     // Timeout-wrapped execution
                     // PTC interception: if this is execute_code and PTC is active,
                     // run Python and concurrently dispatch tool calls from the IPC channel.
-                    let result = if let (true, Some(ptc)) = (
-                        tool_call.name == "execute_code",
-                        ptc_instance.as_mut(),
-                    ) {
+                    let result = if let (true, Some(ptc)) =
+                        (tool_call.name == "execute_code", ptc_instance.as_mut())
+                    {
                         let code = tool_call.input["code"].as_str().unwrap_or("");
                         let ptc_timeout = tool_call.input["timeout"]
                             .as_u64()
@@ -798,13 +812,15 @@ pub async fn run_agent_loop(
                             .clamp(10, 600);
 
                         // Generate SDK and run Python
-                        let sdk = crate::ptc::generate_python_sdk(&ptc.ptc_tools, ptc.ipc_server.port());
+                        let sdk =
+                            crate::ptc::generate_python_sdk(&ptc.ptc_tools, ptc.ipc_server.port());
                         let full_script = crate::ptc::wrap_user_code(&sdk, code);
 
                         // Spawn the Python subprocess as a future
                         let ws = workspace_root.map(|p| p.to_path_buf());
                         let mut python_fut = tokio::spawn(async move {
-                            crate::ptc::execute_python(&full_script, ptc_timeout, ws.as_deref()).await
+                            crate::ptc::execute_python(&full_script, ptc_timeout, ws.as_deref())
+                                .await
                         });
 
                         // Concurrently handle IPC tool requests while Python runs.
@@ -864,47 +880,47 @@ pub async fn run_agent_loop(
                             },
                         }
                     } else {
-                    match tokio::time::timeout(
-                        Duration::from_secs(TOOL_TIMEOUT_SECS),
-                        tool_runner::execute_tool(
-                            &tool_call.id,
-                            &tool_call.name,
-                            &tool_call.input,
-                            kernel.as_ref(),
-                            Some(&allowed_tool_names),
-                            Some(&caller_id_str),
-                            skill_registry,
-                            mcp_connections,
-                            web_ctx,
-                            browser_ctx,
-                            if hand_allowed_env.is_empty() {
-                                None
-                            } else {
-                                Some(&hand_allowed_env)
-                            },
-                            workspace_root,
-                            media_engine,
-                            effective_exec_policy,
-                            tts_engine,
-                            docker_config,
-                            process_manager,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s", TOOL_TIMEOUT_SECS);
-                            openfang_types::tool::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                content: format!(
-                                    "Tool '{}' timed out after {}s.",
-                                    tool_call.name, TOOL_TIMEOUT_SECS
-                                ),
-                                is_error: true,
+                        match tokio::time::timeout(
+                            Duration::from_secs(TOOL_TIMEOUT_SECS),
+                            tool_runner::execute_tool(
+                                &tool_call.id,
+                                &tool_call.name,
+                                &tool_call.input,
+                                kernel.as_ref(),
+                                Some(&allowed_tool_names),
+                                Some(&caller_id_str),
+                                skill_registry,
+                                mcp_connections,
+                                web_ctx,
+                                browser_ctx,
+                                if hand_allowed_env.is_empty() {
+                                    None
+                                } else {
+                                    Some(&hand_allowed_env)
+                                },
+                                workspace_root,
+                                media_engine,
+                                effective_exec_policy,
+                                tts_engine,
+                                docker_config,
+                                process_manager,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                warn!(tool = %tool_call.name, "Tool execution timed out after {}s", TOOL_TIMEOUT_SECS);
+                                openfang_types::tool::ToolResult {
+                                    tool_use_id: tool_call.id.clone(),
+                                    content: format!(
+                                        "Tool '{}' timed out after {}s.",
+                                        tool_call.name, TOOL_TIMEOUT_SECS
+                                    ),
+                                    is_error: true,
+                                }
                             }
-                        }
-                    } // end else (non-execute_code tool dispatch)
+                        } // end else (non-execute_code tool dispatch)
                     };
 
                     // Fire AfterToolCall hook
@@ -1430,7 +1446,9 @@ pub async fn run_agent_loop_streaming(
     // The LLM already received them via llm_messages above.
     for msg in session.messages.iter_mut() {
         if let MessageContent::Blocks(blocks) = &mut msg.content {
-            let had_images = blocks.iter().any(|b| matches!(b, ContentBlock::Image { .. }));
+            let had_images = blocks
+                .iter()
+                .any(|b| matches!(b, ContentBlock::Image { .. }));
             if had_images {
                 blocks.retain(|b| !matches!(b, ContentBlock::Image { .. }));
                 if blocks.is_empty() {
@@ -1465,18 +1483,19 @@ pub async fn run_agent_loop_streaming(
     let ptc_global_enabled = manifest.ptc_enabled.unwrap_or(true);
     let ptc_config = crate::ptc::PtcConfig::default();
 
-    let mut ptc_instance: Option<crate::ptc::PtcInstance> =
-        if ptc_global_enabled && !available_tools.is_empty() {
-            match crate::ptc::init_ptc(available_tools).await {
-                Ok(instance) => Some(instance),
-                Err(e) => {
-                    warn!("PTC initialization failed (streaming), falling back to direct tools: {e}");
-                    None
-                }
+    let mut ptc_instance: Option<crate::ptc::PtcInstance> = if ptc_global_enabled
+        && !available_tools.is_empty()
+    {
+        match crate::ptc::init_ptc(available_tools).await {
+            Ok(instance) => Some(instance),
+            Err(e) => {
+                warn!("PTC initialization failed (streaming), falling back to direct tools: {e}");
+                None
             }
-        } else {
-            None
-        };
+        }
+    } else {
+        None
+    };
 
     let ptc_tools_vec: Vec<ToolDefinition>;
     let available_tools = if let Some(ref ptc) = ptc_instance {
@@ -1660,7 +1679,10 @@ pub async fn run_agent_loop_streaming(
                 // One-shot retry: if the LLM returns empty text with no tool use,
                 // try once more before accepting the empty result.
                 // Triggers on first call OR when input_tokens=0 (silently failed request).
-                if text.trim().is_empty() && response.tool_calls.is_empty() && !response.has_any_content() {
+                if text.trim().is_empty()
+                    && response.tool_calls.is_empty()
+                    && !response.has_any_content()
+                {
                     let is_silent_failure =
                         response.usage.input_tokens == 0 && response.usage.output_tokens == 0;
                     if iteration == 0 || is_silent_failure {
@@ -1903,22 +1925,23 @@ pub async fn run_agent_loop_streaming(
 
                     // Timeout-wrapped execution
                     // PTC interception (streaming): same as non-streaming path.
-                    let result = if let (true, Some(ptc)) = (
-                        tool_call.name == "execute_code",
-                        ptc_instance.as_mut(),
-                    ) {
+                    let result = if let (true, Some(ptc)) =
+                        (tool_call.name == "execute_code", ptc_instance.as_mut())
+                    {
                         let code = tool_call.input["code"].as_str().unwrap_or("");
                         let ptc_timeout = tool_call.input["timeout"]
                             .as_u64()
                             .unwrap_or(ptc_config.timeout_secs)
                             .clamp(10, 600);
 
-                        let sdk = crate::ptc::generate_python_sdk(&ptc.ptc_tools, ptc.ipc_server.port());
+                        let sdk =
+                            crate::ptc::generate_python_sdk(&ptc.ptc_tools, ptc.ipc_server.port());
                         let full_script = crate::ptc::wrap_user_code(&sdk, code);
 
                         let ws = workspace_root.map(|p| p.to_path_buf());
                         let mut python_fut = tokio::spawn(async move {
-                            crate::ptc::execute_python(&full_script, ptc_timeout, ws.as_deref()).await
+                            crate::ptc::execute_python(&full_script, ptc_timeout, ws.as_deref())
+                                .await
                         });
 
                         let python_result: Option<crate::ptc::executor::PythonResult> = loop {
@@ -1970,47 +1993,47 @@ pub async fn run_agent_loop_streaming(
                             },
                         }
                     } else {
-                    match tokio::time::timeout(
-                        Duration::from_secs(TOOL_TIMEOUT_SECS),
-                        tool_runner::execute_tool(
-                            &tool_call.id,
-                            &tool_call.name,
-                            &tool_call.input,
-                            kernel.as_ref(),
-                            Some(&allowed_tool_names),
-                            Some(&caller_id_str),
-                            skill_registry,
-                            mcp_connections,
-                            web_ctx,
-                            browser_ctx,
-                            if hand_allowed_env.is_empty() {
-                                None
-                            } else {
-                                Some(&hand_allowed_env)
-                            },
-                            workspace_root,
-                            media_engine,
-                            effective_exec_policy,
-                            tts_engine,
-                            docker_config,
-                            process_manager,
-                        ),
-                    )
-                    .await
-                    {
-                        Ok(result) => result,
-                        Err(_) => {
-                            warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", TOOL_TIMEOUT_SECS);
-                            openfang_types::tool::ToolResult {
-                                tool_use_id: tool_call.id.clone(),
-                                content: format!(
-                                    "Tool '{}' timed out after {}s.",
-                                    tool_call.name, TOOL_TIMEOUT_SECS
-                                ),
-                                is_error: true,
+                        match tokio::time::timeout(
+                            Duration::from_secs(TOOL_TIMEOUT_SECS),
+                            tool_runner::execute_tool(
+                                &tool_call.id,
+                                &tool_call.name,
+                                &tool_call.input,
+                                kernel.as_ref(),
+                                Some(&allowed_tool_names),
+                                Some(&caller_id_str),
+                                skill_registry,
+                                mcp_connections,
+                                web_ctx,
+                                browser_ctx,
+                                if hand_allowed_env.is_empty() {
+                                    None
+                                } else {
+                                    Some(&hand_allowed_env)
+                                },
+                                workspace_root,
+                                media_engine,
+                                effective_exec_policy,
+                                tts_engine,
+                                docker_config,
+                                process_manager,
+                            ),
+                        )
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(_) => {
+                                warn!(tool = %tool_call.name, "Tool execution timed out after {}s (streaming)", TOOL_TIMEOUT_SECS);
+                                openfang_types::tool::ToolResult {
+                                    tool_use_id: tool_call.id.clone(),
+                                    content: format!(
+                                        "Tool '{}' timed out after {}s.",
+                                        tool_call.name, TOOL_TIMEOUT_SECS
+                                    ),
+                                    is_error: true,
+                                }
                             }
-                        }
-                    } // end else (non-execute_code tool dispatch, streaming)
+                        } // end else (non-execute_code tool dispatch, streaming)
                     };
 
                     // Fire AfterToolCall hook

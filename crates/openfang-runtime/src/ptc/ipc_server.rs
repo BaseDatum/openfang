@@ -83,10 +83,7 @@ pub async fn start_ipc_server(
     ptc_tools: &[ToolDefinition],
 ) -> Result<PtcIpcServer, std::io::Error> {
     // Build tool name set for validation
-    let tool_names: HashMap<String, ()> = ptc_tools
-        .iter()
-        .map(|t| (t.name.clone(), ()))
-        .collect();
+    let tool_names: HashMap<String, ()> = ptc_tools.iter().map(|t| (t.name.clone(), ())).collect();
     let tool_names = Arc::new(tool_names);
 
     // Channel for tool requests: IPC server → agent loop
@@ -98,12 +95,7 @@ pub async fn start_ipc_server(
 
     let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
 
-    let join_handle = tokio::spawn(run_server(
-        listener,
-        tool_names,
-        request_tx,
-        shutdown_rx,
-    ));
+    let join_handle = tokio::spawn(run_server(listener, tool_names, request_tx, shutdown_rx));
 
     debug!(port, "PTC IPC server started");
 
@@ -213,12 +205,7 @@ async fn handle_connection(
 
     // Validate tool exists
     if !tool_names.contains_key(&tool_name) {
-        send_response(
-            &mut stream,
-            404,
-            &format!("Tool not found: {tool_name}"),
-        )
-        .await?;
+        send_response(&mut stream, 404, &format!("Tool not found: {tool_name}")).await?;
         return Ok(());
     }
 
@@ -328,8 +315,7 @@ async fn send_response(
 
 /// Find the end of HTTP headers (double CRLF).
 fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4)
-        .position(|w| w == b"\r\n\r\n")
+    buf.windows(4).position(|w| w == b"\r\n\r\n")
 }
 
 /// Parse Content-Length from raw headers string.

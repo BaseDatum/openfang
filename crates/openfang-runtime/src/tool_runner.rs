@@ -1690,8 +1690,7 @@ fn tool_memory_recall(
             // would produce `"\"{...}\""` — a double-encoded string that the
             // caller must parse twice.
             serde_json::Value::String(s) => Ok(s.clone()),
-            other => Ok(serde_json::to_string_pretty(other)
-                .unwrap_or_else(|_| other.to_string())),
+            other => Ok(serde_json::to_string_pretty(other).unwrap_or_else(|_| other.to_string())),
         },
         None => Ok(format!("No value found for key '{key}'.")),
     }

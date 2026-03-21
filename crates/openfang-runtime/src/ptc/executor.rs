@@ -28,8 +28,10 @@ pub fn is_python3_available() -> bool {
     PYTHON3_AVAILABLE.store(if available { 1 } else { 2 }, Ordering::Relaxed);
 
     if !available {
-        warn!("python3 not found — Programmatic Tool Calling (PTC) will be disabled. \
-               Install Python 3 to enable PTC.");
+        warn!(
+            "python3 not found — Programmatic Tool Calling (PTC) will be disabled. \
+               Install Python 3 to enable PTC."
+        );
     }
 
     available
@@ -58,8 +60,8 @@ pub async fn execute_python(
     timeout_secs: u64,
     workspace_root: Option<&Path>,
 ) -> PythonResult {
-    use tokio::process::Command;
     use tokio::io::AsyncReadExt;
+    use tokio::process::Command;
 
     let mut cmd = Command::new("python3");
     cmd.arg("-u").arg("-c").arg(script);
@@ -99,32 +101,29 @@ pub async fn execute_python(
     let mut stdout_pipe = child.stdout.take().unwrap();
     let mut stderr_pipe = child.stderr.take().unwrap();
 
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        async {
-            let (stdout_result, stderr_result) = tokio::join!(
-                async {
-                    let mut buf = Vec::new();
-                    stdout_pipe.read_to_end(&mut buf).await.ok();
-                    String::from_utf8_lossy(&buf).into_owned()
-                },
-                async {
-                    let mut buf = Vec::new();
-                    stderr_pipe.read_to_end(&mut buf).await.ok();
-                    String::from_utf8_lossy(&buf).into_owned()
-                }
-            );
-
-            let status = child.wait().await;
-            let exit_code = status.map(|s| s.code().unwrap_or(1)).unwrap_or(1);
-
-            PythonResult {
-                stdout: stdout_result,
-                stderr: stderr_result,
-                exit_code,
+    let result = tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        let (stdout_result, stderr_result) = tokio::join!(
+            async {
+                let mut buf = Vec::new();
+                stdout_pipe.read_to_end(&mut buf).await.ok();
+                String::from_utf8_lossy(&buf).into_owned()
+            },
+            async {
+                let mut buf = Vec::new();
+                stderr_pipe.read_to_end(&mut buf).await.ok();
+                String::from_utf8_lossy(&buf).into_owned()
             }
-        },
-    )
+        );
+
+        let status = child.wait().await;
+        let exit_code = status.map(|s| s.code().unwrap_or(1)).unwrap_or(1);
+
+        PythonResult {
+            stdout: stdout_result,
+            stderr: stderr_result,
+            exit_code,
+        }
+    })
     .await;
 
     match result {
@@ -165,8 +164,6 @@ mod tests {
     async fn test_execute_python_timeout() {
         let result = execute_python("import time; time.sleep(60)", 1, None).await;
         assert_ne!(result.exit_code, 0);
-        assert!(
-            result.stderr.contains("timed out") || result.exit_code != 0
-        );
+        assert!(result.stderr.contains("timed out") || result.exit_code != 0);
     }
 }
