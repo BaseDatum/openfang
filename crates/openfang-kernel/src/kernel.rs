@@ -5805,6 +5805,12 @@ impl KernelHandle for OpenFangKernel {
         OpenFangKernel::kill_agent(self, id).map_err(|e| format!("Kill failed: {e}"))
     }
 
+    fn touch_active(&self, agent_id: &str) {
+        if let Ok(id) = agent_id.parse::<AgentId>() {
+            let _ = self.registry.set_state(id, AgentState::Running);
+        }
+    }
+
     fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
         let agent_id = shared_memory_agent_id();
         self.memory
