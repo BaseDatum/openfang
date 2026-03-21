@@ -4825,6 +4825,12 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
                         "url": url,
                     })
                 }
+                openfang_types::config::McpTransportEntry::Http { url } => {
+                    serde_json::json!({
+                        "type": "http",
+                        "url": url,
+                    })
+                }
             };
             serde_json::json!({
                 "name": s.name,
