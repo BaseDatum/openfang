@@ -2576,7 +2576,8 @@ decay_rate = 0.05
                                         checks.push(serde_json::json!({"check": "mcp_server_config", "status": "warn", "name": server.name}));
                                     }
                                 }
-                                openfang_types::config::McpTransportEntry::Sse { url } => {
+                                openfang_types::config::McpTransportEntry::Sse { url }
+                                | openfang_types::config::McpTransportEntry::Http { url } => {
                                     if url.is_empty() {
                                         if !json {
                                             ui::check_warn(&format!(

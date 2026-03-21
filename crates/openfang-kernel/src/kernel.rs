@@ -4988,6 +4988,7 @@ impl OpenFangKernel {
                     args: args.clone(),
                 },
                 McpTransportEntry::Sse { url } => McpTransport::Sse { url: url.clone() },
+                McpTransportEntry::Http { url } => McpTransport::Http { url: url.clone() },
             };
 
             // Resolve env vars from vault/dotenv before passing to MCP subprocess.
@@ -5108,6 +5109,7 @@ impl OpenFangKernel {
                     args: args.clone(),
                 },
                 McpTransportEntry::Sse { url } => McpTransport::Sse { url: url.clone() },
+                McpTransportEntry::Http { url } => McpTransport::Http { url: url.clone() },
             };
 
             let mcp_config = McpServerConfig {
@@ -5227,6 +5229,7 @@ impl OpenFangKernel {
                 args: args.clone(),
             },
             McpTransportEntry::Sse { url } => McpTransport::Sse { url: url.clone() },
+            McpTransportEntry::Http { url } => McpTransport::Http { url: url.clone() },
         };
 
         let mcp_config = McpServerConfig {
@@ -5305,7 +5308,16 @@ impl OpenFangKernel {
     /// If `capabilities.tools` is empty (or contains `"*"`), all tools are
     /// available (backwards compatible).
     fn available_tools(&self, agent_id: AgentId) -> Vec<ToolDefinition> {
-        let all_builtins = builtin_tool_definitions();
+        let all_builtins = if self.config.browser.enabled {
+            builtin_tool_definitions()
+        } else {
+            // When built-in browser is disabled (replaced by an external
+            // browser MCP server such as CamoFox), filter out browser_* tools.
+            builtin_tool_definitions()
+                .into_iter()
+                .filter(|t| !t.name.starts_with("browser_"))
+                .collect()
+        };
 
         // Look up agent entry for profile, skill/MCP allowlists, and declared tools
         let entry = self.registry.get(agent_id);
