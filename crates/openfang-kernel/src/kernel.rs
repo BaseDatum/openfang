@@ -7010,6 +7010,7 @@ impl KernelHandle for OpenFangKernel {
 
     async fn execute_client_tool(
         &self,
+        agent_id: &str,
         tool_name: &str,
         tool_use_id: &str,
         input: &serde_json::Value,
@@ -7023,9 +7024,13 @@ impl KernelHandle for OpenFangKernel {
 
         // Broadcast the tool call to the WS handler. The WS handler
         // subscribes to client_tool_tx and forwards calls to the client.
+        // The `agent_id` field allows WS connections to filter — each
+        // connection only forwards calls from its own agent, preventing
+        // duplicate execution when multiple agents are connected.
         let _ = self.client_tool_tx.send(serde_json::json!({
             "type": "client_tool_call",
             "call_id": call_id,
+            "agent_id": agent_id,
             "tool": tool_name,
             "tool_use_id": tool_use_id,
             "input": input,

@@ -328,9 +328,15 @@ async fn handle_agent_ws(
                 }
             }
             // Forward client tool calls from the kernel to the connected client.
+            // Only forward calls targeting THIS agent to prevent duplicate
+            // execution when multiple agents (e.g. meeting-processor + EA)
+            // are connected simultaneously.
             tool_call = client_tool_rx.recv() => {
                 if let Ok(payload) = tool_call {
-                    let _ = send_json(&sender, &payload).await;
+                    let target = payload["agent_id"].as_str().unwrap_or("");
+                    if target.is_empty() || target == id_str {
+                        let _ = send_json(&sender, &payload).await;
+                    }
                 }
                 continue; // Not a WS message — go back to waiting
             }

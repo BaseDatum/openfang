@@ -491,7 +491,8 @@ pub async fn execute_tool(
             // editing, participants, calendar, transcript corrections, etc.
             if is_client_tool(other) {
                 if let Some(kh) = kernel {
-                    match kh.execute_client_tool(other, tool_use_id, input).await {
+                    let aid = caller_agent_id.unwrap_or("");
+                    match kh.execute_client_tool(aid, other, tool_use_id, input).await {
                         Ok(content) => Ok(content),
                         Err(e) => Err(format!("Client tool failed: {e}")),
                     }

@@ -337,14 +337,19 @@ pub trait KernelHandle: Send + Sync {
     /// The kernel implementation sends a `client_tool_call` event over the
     /// WS and waits for a `client_tool_result` response from the client.
     ///
+    /// `agent_id` identifies the calling agent so the broadcast can be
+    /// scoped to the correct WS connection (prevents duplicate execution
+    /// when multiple agents are connected simultaneously).
+    ///
     /// Returns the tool result content on success, or an error string.
     async fn execute_client_tool(
         &self,
+        agent_id: &str,
         tool_name: &str,
         tool_use_id: &str,
         input: &serde_json::Value,
     ) -> Result<String, String> {
-        let _ = (tool_name, tool_use_id, input);
+        let _ = (agent_id, tool_name, tool_use_id, input);
         Err("Client tool execution not available (no connected client)".to_string())
     }
 }
