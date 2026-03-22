@@ -207,8 +207,32 @@ pub async fn run_agent_loop(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
+    // Determine memory backend — when using hindsight, all embedding and
+    // memory operations are handled server-side so we skip local embedding
+    // calls and the remember step entirely.
+    let memory_backend = manifest
+        .metadata
+        .get("memory_backend")
+        .and_then(|v| v.as_str())
+        .unwrap_or("sqlite");
+    let is_hindsight = memory_backend == "hindsight";
+
+    // Recall relevant memories — when using hindsight, delegate directly to
+    // memory.recall() which routes to the hindsight server (including its own
+    // embedding generation). Otherwise, prefer local vector similarity search.
+    let memories = if is_hindsight {
+        memory
+            .recall(
+                user_message,
+                5,
+                Some(MemoryFilter {
+                    agent_id: Some(session.agent_id),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_default()
+    } else if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
                 debug!("Using vector recall (dims={})", query_vec.len());
@@ -278,7 +302,7 @@ pub async fn run_agent_loop(
             .map(|m| (String::new(), m.content.clone()))
             .collect();
         system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
+        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs, memory_backend));
     }
 
     // Add the user message to session history.
@@ -584,54 +608,54 @@ pub async fn run_agent_loop(
                 // Prune NO_REPLY heartbeat turns to save context budget
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
 
-                // Save session
-                memory
-                    .save_session_async(session)
-                    .await
-                    .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+                // Session save is deferred to the kernel caller (post-response)
+                // so it doesn't block the response event reaching the client.
 
-                // Remember this interaction (with embedding if available)
-                let interaction_text = format!(
-                    "User asked: {}\nI responded: {}",
-                    user_message, final_response
-                );
-                if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
-                        Ok(vec) => {
-                            let _ = memory
-                                .remember_with_embedding_async(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                    Some(&vec),
-                                )
-                                .await;
+                // Remember this interaction locally (only for sqlite backend;
+                // hindsight handles all memory — including embeddings — server-side).
+                if !is_hindsight {
+                    let interaction_text = format!(
+                        "User asked: {}\nI responded: {}",
+                        user_message, final_response
+                    );
+                    if let Some(emb) = embedding_driver {
+                        match emb.embed_one(&interaction_text).await {
+                            Ok(vec) => {
+                                let _ = memory
+                                    .remember_with_embedding_async(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        HashMap::new(),
+                                        Some(&vec),
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!("Embedding for remember failed: {e}");
+                                let _ = memory
+                                    .remember(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        HashMap::new(),
+                                    )
+                                    .await;
+                            }
                         }
-                        Err(e) => {
-                            warn!("Embedding for remember failed: {e}");
-                            let _ = memory
-                                .remember(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                )
-                                .await;
-                        }
+                    } else {
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &interaction_text,
+                                MemorySource::Conversation,
+                                "episodic",
+                                HashMap::new(),
+                            )
+                            .await;
                     }
-                } else {
-                    let _ = memory
-                        .remember(
-                            session.agent_id,
-                            &interaction_text,
-                            MemorySource::Conversation,
-                            "episodic",
-                            HashMap::new(),
-                        )
-                        .await;
                 }
 
                 // Notify phase: Done
@@ -1336,8 +1360,32 @@ pub async fn run_agent_loop_streaming(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Recall relevant memories — prefer vector similarity search when embedding driver is available
-    let memories = if let Some(emb) = embedding_driver {
+    // Determine memory backend — when using hindsight, all embedding and
+    // memory operations are handled server-side so we skip local embedding
+    // calls and the remember step entirely.
+    let memory_backend = manifest
+        .metadata
+        .get("memory_backend")
+        .and_then(|v| v.as_str())
+        .unwrap_or("sqlite");
+    let is_hindsight = memory_backend == "hindsight";
+
+    // Recall relevant memories — when using hindsight, delegate directly to
+    // memory.recall() which routes to the hindsight server (including its own
+    // embedding generation). Otherwise, prefer local vector similarity search.
+    let memories = if is_hindsight {
+        memory
+            .recall(
+                user_message,
+                5,
+                Some(MemoryFilter {
+                    agent_id: Some(session.agent_id),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_or_default()
+    } else if let Some(emb) = embedding_driver {
         match emb.embed_one(user_message).await {
             Ok(query_vec) => {
                 debug!("Using vector recall (streaming, dims={})", query_vec.len());
@@ -1407,7 +1455,7 @@ pub async fn run_agent_loop_streaming(
             .map(|m| (String::new(), m.content.clone()))
             .collect();
         system_prompt.push_str("\n\n");
-        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs));
+        system_prompt.push_str(&crate::prompt_builder::build_memory_section(&mem_pairs, memory_backend));
     }
 
     // Add the user message to session history.
@@ -1707,53 +1755,54 @@ pub async fn run_agent_loop_streaming(
                 // Prune NO_REPLY heartbeat turns to save context budget
                 crate::session_repair::prune_heartbeat_turns(&mut session.messages, 10);
 
-                memory
-                    .save_session_async(session)
-                    .await
-                    .map_err(|e| OpenFangError::Memory(e.to_string()))?;
+                // Session save is deferred to the kernel caller (post-response)
+                // so it doesn't block the response event reaching the client.
 
-                // Remember this interaction (with embedding if available)
-                let interaction_text = format!(
-                    "User asked: {}\nI responded: {}",
-                    user_message, final_response
-                );
-                if let Some(emb) = embedding_driver {
-                    match emb.embed_one(&interaction_text).await {
-                        Ok(vec) => {
-                            let _ = memory
-                                .remember_with_embedding_async(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                    Some(&vec),
-                                )
-                                .await;
+                // Remember this interaction locally (only for sqlite backend;
+                // hindsight handles all memory — including embeddings — server-side).
+                if !is_hindsight {
+                    let interaction_text = format!(
+                        "User asked: {}\nI responded: {}",
+                        user_message, final_response
+                    );
+                    if let Some(emb) = embedding_driver {
+                        match emb.embed_one(&interaction_text).await {
+                            Ok(vec) => {
+                                let _ = memory
+                                    .remember_with_embedding_async(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        HashMap::new(),
+                                        Some(&vec),
+                                    )
+                                    .await;
+                            }
+                            Err(e) => {
+                                warn!("Embedding for remember failed (streaming): {e}");
+                                let _ = memory
+                                    .remember(
+                                        session.agent_id,
+                                        &interaction_text,
+                                        MemorySource::Conversation,
+                                        "episodic",
+                                        HashMap::new(),
+                                    )
+                                    .await;
+                            }
                         }
-                        Err(e) => {
-                            warn!("Embedding for remember failed (streaming): {e}");
-                            let _ = memory
-                                .remember(
-                                    session.agent_id,
-                                    &interaction_text,
-                                    MemorySource::Conversation,
-                                    "episodic",
-                                    HashMap::new(),
-                                )
-                                .await;
-                        }
+                    } else {
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &interaction_text,
+                                MemorySource::Conversation,
+                                "episodic",
+                                HashMap::new(),
+                            )
+                            .await;
                     }
-                } else {
-                    let _ = memory
-                        .remember(
-                            session.agent_id,
-                            &interaction_text,
-                            MemorySource::Conversation,
-                            "episodic",
-                            HashMap::new(),
-                        )
-                        .await;
                 }
 
                 // Notify phase: Done

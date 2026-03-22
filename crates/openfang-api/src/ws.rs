@@ -428,6 +428,40 @@ async fn handle_agent_ws(
                             }
                         }
                     }
+                    // Cancel: abort the running agent task immediately.
+                    // Handled inline (not spawned) so it works while busy.
+                    "cancel" => {
+                        let cancelled = state.kernel.stop_agent_run(agent_id).unwrap_or(false);
+                        if cancelled {
+                            processing.store(false, Ordering::Relaxed);
+                            // Abort the spawned message task so it stops sending events
+                            if let Some(task) = message_task.take() {
+                                task.abort();
+                            }
+                            let _ = send_json(
+                                &sender,
+                                &serde_json::json!({
+                                    "type": "typing", "state": "stop",
+                                }),
+                            ).await;
+                            let _ = send_json(
+                                &sender,
+                                &serde_json::json!({
+                                    "type": "cancelled",
+                                    "message": "Run cancelled.",
+                                }),
+                            ).await;
+                            info!(agent_id = %id_str, "Agent run cancelled via WS cancel message");
+                        } else {
+                            let _ = send_json(
+                                &sender,
+                                &serde_json::json!({
+                                    "type": "cancelled",
+                                    "message": "No active run to cancel.",
+                                }),
+                            ).await;
+                        }
+                    }
                     // Commands (/stop, /model, /compact, etc.) run inline.
                     // This is intentional: /stop must work while the agent is
                     // processing, and other commands are fast enough not to

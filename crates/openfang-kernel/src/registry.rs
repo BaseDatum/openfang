@@ -1,8 +1,10 @@
 //! Agent registry — tracks all agents, their state, and indexes.
 
 use dashmap::DashMap;
+use openfang_memory::session::Session;
 use openfang_types::agent::{AgentEntry, AgentId, AgentMode, AgentState};
 use openfang_types::error::{OpenFangError, OpenFangResult};
+use std::sync::Arc;
 
 /// Registry of all agents in the kernel.
 pub struct AgentRegistry {
@@ -12,6 +14,11 @@ pub struct AgentRegistry {
     name_index: DashMap<String, AgentId>,
     /// Tag index: tag → list of agent IDs.
     tag_index: DashMap<String, Vec<AgentId>>,
+    /// In-memory session cache: agent ID → most recent session.
+    /// Authoritative after an agent loop completes; the background SQLite
+    /// persist is purely for durability. Avoids a FUSE round-trip on the
+    /// next call when the user sends a follow-up message.
+    session_cache: DashMap<AgentId, Arc<Session>>,
 }
 
 impl AgentRegistry {
@@ -21,6 +28,7 @@ impl AgentRegistry {
             agents: DashMap::new(),
             name_index: DashMap::new(),
             tag_index: DashMap::new(),
+            session_cache: DashMap::new(),
         }
     }
 
@@ -79,6 +87,7 @@ impl AgentRegistry {
             .remove(&id)
             .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
         self.name_index.remove(&entry.name);
+        self.session_cache.remove(&id);
         for tag in &entry.tags {
             if let Some(mut ids) = self.tag_index.get_mut(tag) {
                 ids.retain(|&agent_id| agent_id != id);
@@ -116,6 +125,8 @@ impl AgentRegistry {
             .ok_or_else(|| OpenFangError::AgentNotFound(id.to_string()))?;
         entry.session_id = new_session_id;
         entry.last_active = chrono::Utc::now();
+        // Invalidate cached session — the session ID changed.
+        self.session_cache.remove(&id);
         Ok(())
     }
 
@@ -370,6 +381,29 @@ impl AgentRegistry {
         if let Some(mut entry) = self.agents.get_mut(&id) {
             entry.prompt_cache = Some(cache);
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Session cache
+    // -----------------------------------------------------------------
+
+    /// Store a session in the in-memory cache. This is the authoritative
+    /// copy after an agent loop; the SQLite write happens in the background.
+    pub fn set_session_cache(&self, id: AgentId, session: Arc<Session>) {
+        self.session_cache.insert(id, session);
+    }
+
+    /// Take the cached session (removes it from the cache so the caller
+    /// gets exclusive ownership). Returns `None` on cache miss, which
+    /// means the caller should fall back to loading from SQLite.
+    pub fn take_session_cache(&self, id: AgentId) -> Option<Arc<Session>> {
+        self.session_cache.remove(&id).map(|(_, s)| s)
+    }
+
+    /// Invalidate the session cache for an agent (e.g. on session
+    /// switch, delete, or external compaction).
+    pub fn clear_session_cache(&self, id: AgentId) {
+        self.session_cache.remove(&id);
     }
 }
 

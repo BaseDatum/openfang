@@ -568,10 +568,46 @@ impl OpenFangKernel {
             .sqlite_path
             .clone()
             .unwrap_or_else(|| config.data_dir.join("openfang.db"));
-        let memory = Arc::new(
-            MemorySubstrate::open(&db_path, config.memory.decay_rate)
-                .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
-        );
+        let mut substrate = MemorySubstrate::open(&db_path, config.memory.decay_rate)
+            .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?;
+
+        // Optionally enable the Hindsight backend for semantic memory.
+        #[cfg(feature = "hindsight")]
+        if config.memory.backend == "hindsight" {
+            let url = config
+                .memory
+                .hindsight_url
+                .as_deref()
+                .ok_or_else(|| {
+                    KernelError::BootFailed(
+                        "memory.backend = \"hindsight\" but memory.hindsight_url is not set"
+                            .to_string(),
+                    )
+                })?;
+
+            let auth_token = config
+                .memory
+                .hindsight_auth_env
+                .as_deref()
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .ok_or_else(|| {
+                    KernelError::BootFailed(format!(
+                        "memory.backend = \"hindsight\" but env var {:?} is not set",
+                        config.memory.hindsight_auth_env
+                    ))
+                })?;
+
+            info!(
+                url = %url,
+                auth_env = config.memory.hindsight_auth_env.as_deref().unwrap_or("?"),
+                "Enabling Hindsight semantic memory backend"
+            );
+            let backend =
+                openfang_memory::hindsight::HindsightBackend::new(url, &auth_token);
+            substrate = substrate.with_hindsight(backend);
+        }
+
+        let memory = Arc::new(substrate);
 
         // Initialize credential resolver (vault → dotenv → env var)
         let credential_resolver = {
@@ -853,10 +889,17 @@ impl OpenFangKernel {
             ),
         };
 
-        // Auto-detect embedding driver for vector similarity search
+        // Auto-detect embedding driver for vector similarity search.
+        // When Hindsight is the memory backend, embeddings are handled
+        // server-side — skip local embedding driver entirely so the
+        // agent loop falls through to `memory.recall()` / `memory.remember()`
+        // which route through Hindsight.
         let embedding_driver: Option<
             Arc<dyn openfang_runtime::embedding::EmbeddingDriver + Send + Sync>,
-        > = {
+        > = if config.memory.backend == "hindsight" {
+            info!("Hindsight backend active — skipping local embedding driver (embeddings handled server-side)");
+            None
+        } else {
             use openfang_runtime::embedding::create_embedding_driver;
             let configured_model = &config.memory.embedding_model;
             if let Some(ref provider) = config.memory.embedding_provider {
@@ -1709,10 +1752,12 @@ impl OpenFangKernel {
 
         // LLM agent: true streaming via agent loop
         //
-        // Session load runs in spawn_blocking because the SQLite database
-        // lives on a FUSE filesystem (gocryptfs → JuiceFS → S3) where every
-        // I/O call blocks the calling thread for the full network round-trip.
-        let mut session = {
+        // Try the in-memory session cache first (populated after the previous
+        // agent loop). Falls back to SQLite via spawn_blocking when the cache
+        // is cold (first call, after session switch, etc.).
+        let mut session = if let Some(cached) = self.registry.take_session_cache(agent_id) {
+            std::sync::Arc::try_unwrap(cached).unwrap_or_else(|arc| (*arc).clone())
+        } else {
             let memory = Arc::clone(&self.memory);
             let sid = entry.session_id;
             tokio::task::spawn_blocking(move || memory.get_session(sid))
@@ -1925,6 +1970,7 @@ impl OpenFangKernel {
                 sender_id,
                 sender_name,
                 ptc_enabled: manifest.ptc_enabled.unwrap_or(self.config.ptc.enabled),
+                memory_backend: self.config.memory.backend.clone(),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -1938,6 +1984,13 @@ impl OpenFangKernel {
                     serde_json::Value::String(cc_msg),
                 );
             }
+
+            // Store memory backend in metadata so agent_loop can access it
+            // for memory section injection on recall.
+            manifest.metadata.insert(
+                "memory_backend".to_string(),
+                serde_json::Value::String(self.config.memory.backend.clone()),
+            );
         }
 
         let memory = Arc::clone(&self.memory);
@@ -2053,9 +2106,18 @@ impl OpenFangKernel {
 
             match result {
                 Ok(result) => {
-                    // Post-processing I/O: append canonical session, write JSONL
-                    // mirror, and daily memory log. All hit the FUSE filesystem,
-                    // so run in spawn_blocking to avoid starving the tokio runtime.
+                    // Cache the mutated session in memory so the next call
+                    // can skip the FUSE/SQLite round-trip. The background
+                    // persist below is purely for durability.
+                    kernel_clone.registry.set_session_cache(
+                        agent_id,
+                        std::sync::Arc::new(session.clone()),
+                    );
+
+                    // Post-processing I/O: save session, append canonical,
+                    // write JSONL mirror, and daily memory log. All hit the
+                    // FUSE filesystem, so run in spawn_blocking to avoid
+                    // starving the tokio runtime.
                     {
                         let mem = Arc::clone(&memory);
                         let sess = session.clone();
@@ -2064,6 +2126,11 @@ impl OpenFangKernel {
                         let aid = agent_id;
                         let msgs_before = messages_before;
                         let _ = tokio::task::spawn_blocking(move || {
+                            // Persist session to SQLite (durability; the in-memory
+                            // cache is authoritative for the next call).
+                            if let Err(e) = mem.save_session(&sess) {
+                                warn!(agent_id = %aid, "Background session save failed (streaming): {e}");
+                            }
                             if sess.messages.len() > msgs_before {
                                 let new_messages = sess.messages[msgs_before..].to_vec();
                                 if let Err(e) = mem.append_canonical(aid, &new_messages, None) {
@@ -2305,12 +2372,12 @@ impl OpenFangKernel {
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::OpenFang)?;
 
-        // Session load runs in spawn_blocking because the SQLite database
-        // lives on a FUSE filesystem (gocryptfs → JuiceFS → S3) where every
-        // I/O call blocks the calling thread for the full network round-trip.
-        // Without spawn_blocking, this would block a Tokio worker thread and
-        // starve the API server when background agents are active.
-        let mut session = {
+        // Try the in-memory session cache first (populated after the previous
+        // agent loop). Falls back to SQLite via spawn_blocking when the cache
+        // is cold (first call, after session switch, etc.).
+        let mut session = if let Some(cached) = self.registry.take_session_cache(agent_id) {
+            std::sync::Arc::try_unwrap(cached).unwrap_or_else(|arc| (*arc).clone())
+        } else {
             let memory = Arc::clone(&self.memory);
             let sid = entry.session_id;
             tokio::task::spawn_blocking(move || memory.get_session(sid))
@@ -2545,6 +2612,7 @@ impl OpenFangKernel {
                 sender_id,
                 sender_name,
                 ptc_enabled: manifest.ptc_enabled.unwrap_or(self.config.ptc.enabled),
+                memory_backend: self.config.memory.backend.clone(),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2673,39 +2741,44 @@ impl OpenFangKernel {
         .await
         .map_err(KernelError::OpenFang)?;
 
-        // Append new messages to canonical session for cross-channel memory.
-        // Run in spawn_blocking to avoid blocking Tokio worker threads on
-        // FUSE-backed SQLite I/O.
-        if session.messages.len() > messages_before {
-            let new_messages = session.messages[messages_before..].to_vec();
-            let memory = Arc::clone(&self.memory);
-            let aid = agent_id;
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                memory.append_canonical(aid, &new_messages, None)
-            })
-            .await
-            .map_err(|e| OpenFangError::Internal(e.to_string()))
-            .and_then(|r| r)
-            {
-                warn!("Failed to update canonical session: {e}");
-            }
-        }
+        // Cache the mutated session in memory so the next call can skip
+        // the FUSE/SQLite round-trip. The background persist below is
+        // purely for durability.
+        self.registry.set_session_cache(
+            agent_id,
+            std::sync::Arc::new(session.clone()),
+        );
 
-        // Write JSONL session mirror to workspace
-        if let Some(ref workspace) = manifest.workspace {
-            let memory = Arc::clone(&self.memory);
-            let session_clone = session.clone();
-            let sessions_dir = workspace.join("sessions");
-            if let Err(e) = tokio::task::spawn_blocking(move || {
-                memory.write_jsonl_mirror(&session_clone, &sessions_dir)
+        // Post-processing I/O: save session, append canonical, write JSONL
+        // mirror, and daily memory log. All hit the FUSE filesystem, so run
+        // in spawn_blocking to avoid blocking Tokio worker threads.
+        {
+            let mem = Arc::clone(&self.memory);
+            let sess = session.clone();
+            let ws = manifest.workspace.clone();
+            let response_text = result.response.clone();
+            let aid = agent_id;
+            let msgs_before = messages_before;
+            let _ = tokio::task::spawn_blocking(move || {
+                // Persist session to SQLite (durability; the in-memory
+                // cache is authoritative for the next call).
+                if let Err(e) = mem.save_session(&sess) {
+                    warn!(agent_id = %aid, "Background session save failed: {e}");
+                }
+                if sess.messages.len() > msgs_before {
+                    let new_messages = sess.messages[msgs_before..].to_vec();
+                    if let Err(e) = mem.append_canonical(aid, &new_messages, None) {
+                        warn!(agent_id = %aid, "Failed to update canonical session: {e}");
+                    }
+                }
+                if let Some(ref workspace) = ws {
+                    if let Err(e) = mem.write_jsonl_mirror(&sess, &workspace.join("sessions")) {
+                        warn!("Failed to write JSONL session mirror: {e}");
+                    }
+                    append_daily_memory_log(workspace, &response_text);
+                }
             })
-            .await
-            .unwrap_or_else(|e| Err(std::io::Error::other(e)))
-            {
-                warn!("Failed to write JSONL session mirror: {e}");
-            }
-            // Append daily memory log (best-effort)
-            append_daily_memory_log(workspace, &result.response);
+            .await;
         }
 
         // Record usage in the metering engine (uses catalog pricing as single source of truth)
@@ -3299,6 +3372,10 @@ impl OpenFangKernel {
             .save_session_async(&updated_session)
             .await
             .map_err(KernelError::OpenFang)?;
+
+        // Invalidate the in-memory session cache — compaction rewrote the
+        // session, so the next call must use the freshly compacted version.
+        self.registry.clear_session_cache(agent_id);
 
         // Build result message with audit summary
         let mut msg = format!(

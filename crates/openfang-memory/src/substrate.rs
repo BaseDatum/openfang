@@ -23,8 +23,17 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
+#[cfg(feature = "hindsight")]
+use crate::hindsight::HindsightBackend;
+
 /// The unified memory substrate. Implements the `Memory` trait by delegating
 /// to specialized stores backed by a shared SQLite connection.
+///
+/// When the `hindsight` feature is enabled and configured, semantic operations
+/// (remember, recall, forget) and knowledge-graph operations (add_entity,
+/// add_relation, query_graph, consolidate) are routed to a Hindsight server
+/// instead of the local SQLite stores. Structured operations (KV, sessions,
+/// tasks, devices) always use the local SQLite database.
 pub struct MemorySubstrate {
     conn: Arc<Mutex<Connection>>,
     structured: StructuredStore,
@@ -33,6 +42,10 @@ pub struct MemorySubstrate {
     sessions: SessionStore,
     consolidation: ConsolidationEngine,
     usage: UsageStore,
+
+    /// When set, semantic and graph operations are routed to Hindsight.
+    #[cfg(feature = "hindsight")]
+    hindsight: Option<HindsightBackend>,
 }
 
 impl MemorySubstrate {
@@ -52,6 +65,8 @@ impl MemorySubstrate {
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
+            #[cfg(feature = "hindsight")]
+            hindsight: None,
         })
     }
 
@@ -70,7 +85,20 @@ impl MemorySubstrate {
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
+            #[cfg(feature = "hindsight")]
+            hindsight: None,
         })
+    }
+
+    /// Enable the Hindsight backend for semantic and graph operations.
+    ///
+    /// When set, `remember`, `recall`, `forget`, `add_entity`, `add_relation`,
+    /// `query_graph`, and `consolidate` are routed to the Hindsight server.
+    /// All other operations (KV, sessions, tasks) remain on SQLite.
+    #[cfg(feature = "hindsight")]
+    pub fn with_hindsight(mut self, backend: HindsightBackend) -> Self {
+        self.hindsight = Some(backend);
+        self
     }
 
     /// Get a reference to the usage store.
@@ -662,6 +690,11 @@ impl Memory for MemorySubstrate {
         scope: &str,
         metadata: HashMap<String, serde_json::Value>,
     ) -> OpenFangResult<MemoryId> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.remember(agent_id, content, source, scope, metadata).await;
+        }
+
         let store = self.semantic.clone();
         let content = content.to_string();
         let scope = scope.to_string();
@@ -678,6 +711,11 @@ impl Memory for MemorySubstrate {
         limit: usize,
         filter: Option<MemoryFilter>,
     ) -> OpenFangResult<Vec<MemoryFragment>> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.recall(query, limit, filter).await;
+        }
+
         let store = self.semantic.clone();
         let query = query.to_string();
         tokio::task::spawn_blocking(move || store.recall(&query, limit, filter))
@@ -686,6 +724,11 @@ impl Memory for MemorySubstrate {
     }
 
     async fn forget(&self, id: MemoryId) -> OpenFangResult<()> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.forget(id).await;
+        }
+
         let store = self.semantic.clone();
         tokio::task::spawn_blocking(move || store.forget(id))
             .await
@@ -693,6 +736,11 @@ impl Memory for MemorySubstrate {
     }
 
     async fn add_entity(&self, entity: Entity) -> OpenFangResult<String> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.add_entity(entity).await;
+        }
+
         let store = self.knowledge.clone();
         tokio::task::spawn_blocking(move || store.add_entity(entity))
             .await
@@ -700,6 +748,11 @@ impl Memory for MemorySubstrate {
     }
 
     async fn add_relation(&self, relation: Relation) -> OpenFangResult<String> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.add_relation(relation).await;
+        }
+
         let store = self.knowledge.clone();
         tokio::task::spawn_blocking(move || store.add_relation(relation))
             .await
@@ -707,6 +760,11 @@ impl Memory for MemorySubstrate {
     }
 
     async fn query_graph(&self, pattern: GraphPattern) -> OpenFangResult<Vec<GraphMatch>> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.query_graph(pattern).await;
+        }
+
         let store = self.knowledge.clone();
         tokio::task::spawn_blocking(move || store.query_graph(pattern))
             .await
@@ -714,6 +772,11 @@ impl Memory for MemorySubstrate {
     }
 
     async fn consolidate(&self) -> OpenFangResult<ConsolidationReport> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.consolidate().await;
+        }
+
         let engine = self.consolidation.clone();
         tokio::task::spawn_blocking(move || engine.consolidate())
             .await

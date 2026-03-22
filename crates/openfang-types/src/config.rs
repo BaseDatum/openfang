@@ -1573,10 +1573,30 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
+
+    /// Memory backend: "sqlite" (default) or "hindsight".
+    /// When set to "hindsight", semantic memory operations (remember, recall,
+    /// forget) are routed to a Hindsight server while structured ops (KV,
+    /// sessions, tasks) remain on the local SQLite database.
+    #[serde(default = "default_memory_backend")]
+    pub backend: String,
+    /// Hindsight server URL (e.g., "http://hindsight.dialogue.svc:8888").
+    /// Only used when `backend = "hindsight"`.
+    #[serde(default)]
+    pub hindsight_url: Option<String>,
+    /// Environment variable name containing the auth token for Hindsight.
+    /// The value is sent as `Authorization: Bearer {token}`.
+    /// Only used when `backend = "hindsight"`.
+    #[serde(default)]
+    pub hindsight_auth_env: Option<String>,
 }
 
 fn default_consolidation_interval() -> u64 {
     24
+}
+
+fn default_memory_backend() -> String {
+    "sqlite".to_string()
 }
 
 impl Default for MemoryConfig {
@@ -1589,6 +1609,9 @@ impl Default for MemoryConfig {
             embedding_provider: None,
             embedding_api_key_env: None,
             consolidation_interval_hours: default_consolidation_interval(),
+            backend: default_memory_backend(),
+            hindsight_url: None,
+            hindsight_auth_env: None,
         }
     }
 }
