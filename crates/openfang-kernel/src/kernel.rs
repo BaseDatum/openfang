@@ -5385,7 +5385,7 @@ impl OpenFangKernel {
     /// If `capabilities.tools` is empty (or contains `"*"`), all tools are
     /// available (backwards compatible).
     fn available_tools(&self, agent_id: AgentId) -> Vec<ToolDefinition> {
-        let all_builtins = if self.config.browser.enabled {
+        let mut all_builtins = if self.config.browser.enabled {
             builtin_tool_definitions()
         } else {
             // When built-in browser is disabled (replaced by an external
@@ -5395,6 +5395,11 @@ impl OpenFangKernel {
                 .filter(|t| !t.name.starts_with("browser_"))
                 .collect()
         };
+
+        // Add hindsight-specific tools (memory_retain, memory_reflect) when backend is hindsight
+        if self.config.memory.backend == "hindsight" {
+            all_builtins.extend(openfang_runtime::tool_runner::hindsight_tool_definitions());
+        }
 
         // Look up agent entry for profile, skill/MCP allowlists, and declared tools
         let entry = self.registry.get(agent_id);
@@ -6236,6 +6241,41 @@ impl KernelHandle for OpenFangKernel {
             .query_graph(pattern)
             .await
             .map_err(|e| format!("Knowledge query failed: {e}"))
+    }
+
+    #[cfg(feature = "hindsight")]
+    async fn memory_retain(
+        &self,
+        agent_id: &str,
+        content: &str,
+        context: &str,
+        tags: Option<Vec<String>>,
+        metadata: Option<std::collections::HashMap<String, String>>,
+        timestamp: Option<&str>,
+    ) -> Result<String, String> {
+        let aid = openfang_types::agent::AgentId(
+            uuid::Uuid::parse_str(agent_id).map_err(|e| format!("Invalid agent ID: {e}"))?,
+        );
+        self.memory
+            .retain_explicit(aid, content, context, tags, metadata, timestamp)
+            .await
+            .map_err(|e| format!("memory_retain failed: {e}"))
+    }
+
+    #[cfg(feature = "hindsight")]
+    async fn memory_reflect(
+        &self,
+        agent_id: &str,
+        query: &str,
+        budget: Option<&str>,
+    ) -> Result<String, String> {
+        let aid = openfang_types::agent::AgentId(
+            uuid::Uuid::parse_str(agent_id).map_err(|e| format!("Invalid agent ID: {e}"))?,
+        );
+        self.memory
+            .reflect(aid, query, budget)
+            .await
+            .map_err(|e| format!("memory_reflect failed: {e}"))
     }
 
     /// Spawn with capability inheritance enforcement.

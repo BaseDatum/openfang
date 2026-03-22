@@ -207,9 +207,8 @@ pub async fn run_agent_loop(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Determine memory backend — when using hindsight, all embedding and
-    // memory operations are handled server-side so we skip local embedding
-    // calls and the remember step entirely.
+    // Determine memory backend — when using hindsight, embedding and recall
+    // are handled server-side. Retention goes through hindsight's async pipeline.
     let memory_backend = manifest
         .metadata
         .get("memory_backend")
@@ -611,14 +610,25 @@ pub async fn run_agent_loop(
                 // Session save is deferred to the kernel caller (post-response)
                 // so it doesn't block the response event reaching the client.
 
-                // Remember this interaction locally (only for sqlite backend;
-                // hindsight handles all memory — including embeddings — server-side).
-                if !is_hindsight {
+                // Remember this interaction — route to appropriate backend.
+                // Hindsight: async retain (background LLM fact extraction).
+                // SQLite: local embedding + store.
+                {
                     let interaction_text = format!(
                         "User asked: {}\nI responded: {}",
                         user_message, final_response
                     );
-                    if let Some(emb) = embedding_driver {
+                    if is_hindsight {
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &interaction_text,
+                                MemorySource::Conversation,
+                                "episodic",
+                                HashMap::new(),
+                            )
+                            .await;
+                    } else if let Some(emb) = embedding_driver {
                         match emb.embed_one(&interaction_text).await {
                             Ok(vec) => {
                                 let _ = memory
@@ -1360,9 +1370,8 @@ pub async fn run_agent_loop_streaming(
         .and_then(|v| serde_json::from_value(v.clone()).ok())
         .unwrap_or_default();
 
-    // Determine memory backend — when using hindsight, all embedding and
-    // memory operations are handled server-side so we skip local embedding
-    // calls and the remember step entirely.
+    // Determine memory backend — when using hindsight, embedding and recall
+    // are handled server-side. Retention goes through hindsight's async pipeline.
     let memory_backend = manifest
         .metadata
         .get("memory_backend")
@@ -1758,14 +1767,25 @@ pub async fn run_agent_loop_streaming(
                 // Session save is deferred to the kernel caller (post-response)
                 // so it doesn't block the response event reaching the client.
 
-                // Remember this interaction locally (only for sqlite backend;
-                // hindsight handles all memory — including embeddings — server-side).
-                if !is_hindsight {
+                // Remember this interaction — route to appropriate backend.
+                // Hindsight: async retain (background LLM fact extraction).
+                // SQLite: local embedding + store.
+                {
                     let interaction_text = format!(
                         "User asked: {}\nI responded: {}",
                         user_message, final_response
                     );
-                    if let Some(emb) = embedding_driver {
+                    if is_hindsight {
+                        let _ = memory
+                            .remember(
+                                session.agent_id,
+                                &interaction_text,
+                                MemorySource::Conversation,
+                                "episodic",
+                                HashMap::new(),
+                            )
+                            .await;
+                    } else if let Some(emb) = embedding_driver {
                         match emb.embed_one(&interaction_text).await {
                             Ok(vec) => {
                                 let _ = memory

@@ -100,6 +100,31 @@ pub trait KernelHandle: Send + Sync {
         pattern: openfang_types::memory::GraphPattern,
     ) -> Result<Vec<openfang_types::memory::GraphMatch>, String>;
 
+    /// Explicitly retain a memory fact (Hindsight backend only).
+    async fn memory_retain(
+        &self,
+        agent_id: &str,
+        content: &str,
+        context: &str,
+        tags: Option<Vec<String>>,
+        metadata: Option<std::collections::HashMap<String, String>>,
+        timestamp: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = (agent_id, content, context, tags, metadata, timestamp);
+        Err("memory_retain requires hindsight backend".to_string())
+    }
+
+    /// Synthesized reasoning across stored memories (Hindsight backend only).
+    async fn memory_reflect(
+        &self,
+        agent_id: &str,
+        query: &str,
+        budget: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = (agent_id, query, budget);
+        Err("memory_reflect requires hindsight backend".to_string())
+    }
+
     /// Create a cron job for the calling agent.
     async fn cron_create(
         &self,

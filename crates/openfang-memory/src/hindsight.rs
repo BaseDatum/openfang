@@ -118,7 +118,7 @@ impl HindsightBackend {
 
         let request = types::RetainRequest {
             items: vec![item],
-            async_: false,
+            async_: true,
             document_tags: None,
         };
 
@@ -130,7 +130,7 @@ impl HindsightBackend {
         // Hindsight doesn't return per-item IDs from retain, so we generate
         // a synthetic MemoryId. The real ID lives in Hindsight's database.
         let id = MemoryId(Uuid::new_v4());
-        debug!(memory_id = %id, "Retained memory in Hindsight");
+        debug!(memory_id = %id, "Retained memory in Hindsight (async)");
         Ok(id)
     }
 
@@ -247,6 +247,113 @@ impl HindsightBackend {
             "Hindsight backend: forget() is a no-op — Hindsight manages memory lifecycle internally"
         );
         Ok(())
+    }
+
+    // -----------------------------------------------------------------
+    // Explicit tool operations (memory_retain, memory_reflect)
+    // -----------------------------------------------------------------
+
+    /// Explicitly retain a fact via the `memory_retain` tool.
+    ///
+    /// Unlike `remember()` (called automatically after each conversation turn),
+    /// this is invoked when the LLM explicitly decides something is worth storing.
+    /// Uses async retain — Hindsight workers handle fact extraction in background.
+    pub async fn retain_explicit(
+        &self,
+        agent_id: AgentId,
+        content: &str,
+        context: &str,
+        tags: Option<Vec<String>>,
+        metadata: Option<HashMap<String, String>>,
+        timestamp: Option<&str>,
+    ) -> OpenFangResult<String> {
+        let mut all_tags = vec![format!("agent:{}", agent_id.0)];
+        if let Some(user_tags) = tags {
+            all_tags.extend(user_tags);
+        }
+
+        let mut meta_map = metadata.unwrap_or_default();
+        meta_map.insert("agent_id".to_string(), agent_id.0.to_string());
+        meta_map.insert("source".to_string(), "explicit_retain".to_string());
+
+        let ts = timestamp.map(|t| types::MemoryItemTimestamp {
+            subtype_0: None,
+            subtype_1: Some(t.to_string()),
+        });
+
+        let item = types::MemoryItem {
+            content: content.to_string(),
+            context: Some(context.to_string()),
+            tags: Some(all_tags),
+            metadata: Some(meta_map),
+            timestamp: ts,
+            document_id: None,
+            entities: None,
+            observation_scopes: None,
+            strategy: None,
+        };
+
+        let request = types::RetainRequest {
+            items: vec![item],
+            async_: true,
+            document_tags: None,
+        };
+
+        let response = self
+            .client
+            .retain_memories(&self.bank_id, None, &request)
+            .await
+            .map_err(|e| OpenFangError::Memory(format!("Hindsight retain_explicit failed: {e}")))?;
+
+        let result = response.into_inner();
+        let op_id = result
+            .operation_id
+            .unwrap_or_else(|| "accepted".to_string());
+        debug!(operation_id = %op_id, "Explicit retain submitted to Hindsight");
+        Ok(format!("Memory accepted for processing (operation: {op_id})"))
+    }
+
+    /// Reflect — synthesized reasoning across stored memories.
+    ///
+    /// Calls Hindsight's reflect endpoint which runs an agentic LLM workflow:
+    /// retrieves relevant memories, mental models, and observations, then
+    /// synthesizes a reasoned answer. Much more powerful than raw recall.
+    pub async fn reflect(
+        &self,
+        agent_id: AgentId,
+        query: &str,
+        budget: Option<&str>,
+    ) -> OpenFangResult<String> {
+        let budget_enum = match budget.unwrap_or("low") {
+            "mid" => types::Budget::Mid,
+            "high" => types::Budget::High,
+            _ => types::Budget::Low,
+        };
+
+        let request = types::ReflectRequest {
+            query: query.to_string(),
+            budget: Some(budget_enum),
+            context: None,
+            max_tokens: 4096,
+            tags: Some(vec![format!("agent:{}", agent_id.0)]),
+            tags_match: types::TagsMatch::AnyStrict,
+            tag_groups: None,
+            include: None,
+            response_schema: None,
+            exclude_mental_models: false,
+            exclude_mental_model_ids: None,
+            fact_types: None,
+        };
+
+        let response = self
+            .client
+            .reflect(&self.bank_id, None, &request)
+            .await
+            .map_err(|e| OpenFangError::Memory(format!("Hindsight reflect failed: {e}")))?;
+
+        let result = response.into_inner();
+        debug!(text_len = result.text.len(), "Reflect completed from Hindsight");
+        Ok(result.text)
     }
 
     // -----------------------------------------------------------------

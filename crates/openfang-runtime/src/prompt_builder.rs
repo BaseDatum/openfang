@@ -336,11 +336,19 @@ Exact-key structured storage. Use for data you need to retrieve by a known key.
 - Good for: settings, config, structured state (e.g. `memory_store(\"user_timezone\", \"Europe/Lisbon\")`).
 - **KV data is invisible to semantic search.** If you store something in KV and later need to find it without knowing the key, you won't.
 
-### Semantic Memory (remember / recall via conversation)
-Your conversation history is automatically stored in a semantic memory system that understands meaning. Every interaction is retained and searchable by meaning.
-- The system automatically remembers what you discuss with the user.
-- You can semantically search past interactions — the system finds relevant memories by meaning, not exact match.
-- Entities (people, projects, concepts) and their relationships are automatically extracted and tracked.
+### Semantic Memory (automatic + memory_retain)
+Your conversation history is automatically stored in a semantic memory system. Every interaction is retained, processed into structured facts, and searchable by meaning.
+- The system automatically remembers what you discuss with the user — no action needed.
+- `memory_retain(content, context?, tags?, metadata?, timestamp?)` — explicitly store an important fact. Use for key information you want to emphasize or information from external sources that won't appear in conversation naturally.
+- Entities and relationships are automatically extracted and tracked.
+- The system consolidates redundant memories and builds evolving mental models over time.
+
+### Reflect (memory_reflect)
+Synthesized reasoning across all stored memories.
+- `memory_reflect(query, budget?)` — ask a question and get a thoughtful analysis that reasons across everything known about the user.
+- Use for: \"what patterns have emerged in my work\", \"what approach would suit me best\", \"how should I prioritize these tasks\".
+- Different from recall (raw fact lookup) — reflect thinks through the answer.
+- Budget: \"low\" (quick), \"mid\" (moderate), \"high\" (thorough). Default: \"low\".
 
 ### Knowledge Graph (knowledge_add_entity, knowledge_add_relation, knowledge_query)
 Explicit structured facts stored as rich semantic memories. Use for important entities and relationships you want to track.
@@ -350,9 +358,11 @@ Explicit structured facts stored as rich semantic memories. Use for important en
 - These are stored as rich semantic facts, so they also appear in semantic recall.
 
 ### Best Practices
-- **Bridging KV and semantic memory:** If you store structured data in KV, also retain a semantic note about it so you can find it later. Example: store `memory_store(\"user_timezone\", \"Europe/Lisbon\")` AND the conversation naturally records \"Sky's timezone is Europe/Lisbon\" which is semantically searchable.
-- Store knowledge graph entities proactively for people, projects, and key facts — they carry richer context than KV pairs.
-- Don't store the same information repeatedly — the semantic system consolidates and deduplicates automatically.
+- Conversations are auto-retained — don't use `memory_retain` to re-store what was just said.
+- Use `memory_retain` for facts from external sources (files, web searches, tool outputs) that the user wants remembered.
+- Use `memory_reflect` before giving advice that should account for the user's history and preferences.
+- Store knowledge graph entities proactively for people, projects, and key facts.
+- Don't store the same information repeatedly — the system consolidates and deduplicates automatically.
 - When the user corrects information, the correction naturally supersedes older memories over time.";
 
 /// Memory guidance for the default SQLite KV backend.

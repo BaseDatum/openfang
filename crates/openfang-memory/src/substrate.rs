@@ -486,6 +486,48 @@ impl MemorySubstrate {
     }
 
     // -----------------------------------------------------------------
+    // Hindsight-specific operations (memory_retain, memory_reflect)
+    // -----------------------------------------------------------------
+
+    /// Explicitly retain a fact (Hindsight only). Used by the `memory_retain` tool.
+    #[cfg(feature = "hindsight")]
+    pub async fn retain_explicit(
+        &self,
+        agent_id: AgentId,
+        content: &str,
+        context: &str,
+        tags: Option<Vec<String>>,
+        metadata: Option<std::collections::HashMap<String, String>>,
+        timestamp: Option<&str>,
+    ) -> OpenFangResult<String> {
+        if let Some(ref hs) = self.hindsight {
+            return hs
+                .retain_explicit(agent_id, content, context, tags, metadata, timestamp)
+                .await;
+        }
+        Err(OpenFangError::Memory(
+            "retain_explicit requires hindsight backend".to_string(),
+        ))
+    }
+
+    /// Reflect — synthesized reasoning across memories (Hindsight only).
+    /// Used by the `memory_reflect` tool.
+    #[cfg(feature = "hindsight")]
+    pub async fn reflect(
+        &self,
+        agent_id: AgentId,
+        query: &str,
+        budget: Option<&str>,
+    ) -> OpenFangResult<String> {
+        if let Some(ref hs) = self.hindsight {
+            return hs.reflect(agent_id, query, budget).await;
+        }
+        Err(OpenFangError::Memory(
+            "reflect requires hindsight backend".to_string(),
+        ))
+    }
+
+    // -----------------------------------------------------------------
     // Task queue operations
     // -----------------------------------------------------------------
 

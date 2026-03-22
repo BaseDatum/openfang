@@ -325,6 +325,10 @@ pub async fn execute_tool(
         "knowledge_add_relation" => tool_knowledge_add_relation(input, kernel).await,
         "knowledge_query" => tool_knowledge_query(input, kernel).await,
 
+        // Hindsight memory tools (memory_retain, memory_reflect)
+        "memory_retain" => tool_memory_retain(input, kernel, caller_agent_id).await,
+        "memory_reflect" => tool_memory_reflect(input, kernel, caller_agent_id).await,
+
         // Image analysis tool
         "image_analyze" => tool_image_analyze(input).await,
 
@@ -1507,6 +1511,75 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
     ]
 }
 
+/// Tool definitions for Hindsight-specific memory tools.
+///
+/// These are registered conditionally — only when `memory.backend = "hindsight"`.
+/// They are NOT included in `builtin_tool_definitions()` to avoid showing them
+/// to agents running on the SQLite backend.
+pub fn hindsight_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "memory_retain".to_string(),
+            description: "Explicitly store an important fact or memory. Use for key information \
+                the user shares that you want to ensure is remembered long-term. Conversations \
+                are automatically retained, but use this tool to emphasize critical facts or \
+                store information from external sources."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The fact or memory to store (be specific and include context)"
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Category for the memory (e.g., 'preferences', 'work', 'personal', 'technical'). Default: 'general'"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional tags for organizing and filtering (e.g., ['project:alpha'])"
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional key-value metadata (e.g., {\"source\": \"email\", \"priority\": \"high\"})"
+                    },
+                    "timestamp": {
+                        "type": "string",
+                        "description": "When this fact occurred (ISO 8601, e.g., '2024-01-15T10:30:00Z'). Omit for 'now'."
+                    }
+                },
+                "required": ["content"]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_reflect".to_string(),
+            description: "Synthesize and reason across stored memories to answer a question. \
+                Unlike recall (which returns raw facts), reflect thinks through the question \
+                using everything known about the user and produces a reasoned analysis. \
+                Use for questions like 'what patterns have emerged', 'what should I prioritize', \
+                or 'what approach would suit me best'."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The question or topic to reflect on"
+                    },
+                    "budget": {
+                        "type": "string",
+                        "enum": ["low", "mid", "high"],
+                        "description": "Search depth - 'low' for quick synthesis, 'high' for thorough analysis. Default: 'low'"
+                    }
+                },
+                "required": ["query"]
+            }),
+        },
+    ]
+}
+
 // ---------------------------------------------------------------------------
 // Filesystem tools
 // ---------------------------------------------------------------------------
@@ -2278,6 +2351,48 @@ async fn tool_knowledge_query(
         ));
     }
     Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// Hindsight memory tools (memory_retain, memory_reflect)
+// ---------------------------------------------------------------------------
+
+async fn tool_memory_retain(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = caller_agent_id.ok_or("No caller agent ID")?;
+    let content = input["content"]
+        .as_str()
+        .ok_or("Missing 'content' parameter")?;
+    let context = input["context"].as_str().unwrap_or("general");
+    let tags: Option<Vec<String>> = input
+        .get("tags")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let metadata: Option<std::collections::HashMap<String, String>> = input
+        .get("metadata")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let timestamp = input["timestamp"].as_str();
+
+    kh.memory_retain(agent_id, content, context, tags, metadata, timestamp)
+        .await
+}
+
+async fn tool_memory_reflect(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = caller_agent_id.ok_or("No caller agent ID")?;
+    let query = input["query"]
+        .as_str()
+        .ok_or("Missing 'query' parameter")?;
+    let budget = input["budget"].as_str();
+
+    kh.memory_reflect(agent_id, query, budget).await
 }
 
 // ---------------------------------------------------------------------------
