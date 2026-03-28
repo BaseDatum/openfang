@@ -102,6 +102,16 @@ const CLIENT_TOOL_NAMES: &[&str] = &[
     "append_markdown",
     "search_notes",
     "propose_github_issue",
+    "propose_email",
+    "propose_calendar_event",
+    "propose_google_doc",
+    "propose_jira_issue",
+    "propose_confluence_notes",
+    "propose_slack_message",
+    "propose_slack_canvas",
+    "propose_slack_post_notes",
+    "propose_salesforce_update",
+    "propose_hubspot_update",
 ];
 
 /// Check if a tool name is a client-side tool.
@@ -1553,6 +1563,164 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["owner", "repo", "title"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_email".to_string(),
+            description: "Insert an interactive action block that lets the user send an email via their connected Google account. Pre-populates recipient, subject, and body. The user reviews and clicks to send. Use when a follow-up email is discussed.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "to": { "type": "string", "description": "Recipient email address" },
+                    "subject": { "type": "string", "description": "Email subject line" },
+                    "body": { "type": "string", "description": "Email body text" },
+                    "cc": { "type": "string", "description": "CC recipient(s), comma-separated" },
+                    "bcc": { "type": "string", "description": "BCC recipient(s), comma-separated" }
+                },
+                "required": ["to", "subject"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_calendar_event".to_string(),
+            description: "Insert an interactive action block that lets the user schedule a Google Calendar event. Pre-populates title, time, attendees. The user reviews and clicks to create. Use when a meeting or event is discussed.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "summary": { "type": "string", "description": "Event title" },
+                    "start_time": { "type": "string", "description": "Start time in ISO 8601 format (e.g. 2026-03-28T14:00:00-04:00)" },
+                    "end_time": { "type": "string", "description": "End time in ISO 8601 format" },
+                    "description": { "type": "string", "description": "Event description" },
+                    "location": { "type": "string", "description": "Event location" },
+                    "attendees": { "type": "array", "items": { "type": "string" }, "description": "Attendee email addresses" },
+                    "calendar_id": { "type": "string", "description": "Calendar ID (default: primary)" }
+                },
+                "required": ["summary", "start_time", "end_time"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_google_doc".to_string(),
+            description: "Insert an interactive action block that lets the user create a Google Doc from meeting notes or content. The user reviews and clicks to create. Use when notes should be formalized into a document.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Document title" },
+                    "content": { "type": "string", "description": "Document content (plain text)" }
+                },
+                "required": ["title"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_jira_issue".to_string(),
+            description: "Insert an interactive action block that lets the user create a Jira issue. Pre-populates project, summary, description. The user reviews and clicks to create. Use when a task, bug, or story is discussed and the team uses Jira.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "project_key": { "type": "string", "description": "Jira project key (e.g. PROJ)" },
+                    "summary": { "type": "string", "description": "Issue summary/title" },
+                    "description": { "type": "string", "description": "Issue description" },
+                    "issue_type": { "type": "string", "description": "Issue type: Task, Bug, Story, Epic (default: Task)" },
+                    "priority": { "type": "string", "description": "Priority: Highest, High, Medium, Low, Lowest" },
+                    "labels": { "type": "array", "items": { "type": "string" }, "description": "Labels to apply" }
+                },
+                "required": ["project_key", "summary"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_confluence_notes".to_string(),
+            description: "Insert an interactive action block that lets the user create a Confluence page from meeting notes. The user reviews and clicks to create. Use when notes should be published to Confluence.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "space_key": { "type": "string", "description": "Confluence space key (e.g. TEAM)" },
+                    "title": { "type": "string", "description": "Page title" },
+                    "content": { "type": "string", "description": "Page content (plain text or HTML)" },
+                    "parent_page_id": { "type": "string", "description": "Optional parent page ID to nest under" }
+                },
+                "required": ["space_key", "title"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_slack_message".to_string(),
+            description: "Insert an interactive action block that lets the user send a Slack message as themselves. Pre-populates channel and text. The user reviews and clicks to send. Use when the user should follow up in Slack.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Slack channel ID or name" },
+                    "text": { "type": "string", "description": "Message text (supports Slack mrkdwn formatting)" },
+                    "thread_ts": { "type": "string", "description": "Thread timestamp to reply to" }
+                },
+                "required": ["channel", "text"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_slack_canvas".to_string(),
+            description: "Insert an interactive action block that lets the user create a Slack canvas from meeting notes. Canvases are rich collaborative documents in Slack. The user reviews and clicks to create.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Canvas title" },
+                    "content": { "type": "string", "description": "Canvas content (markdown)" },
+                    "channel_id": { "type": "string", "description": "Optional channel to share the canvas to" }
+                },
+                "required": ["title", "content"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_slack_post_notes".to_string(),
+            description: "Insert an interactive action block that lets the user post formatted meeting notes to a Slack channel. The user reviews and clicks to post. Use when notes should be shared with a team channel.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "channel": { "type": "string", "description": "Slack channel ID" },
+                    "title": { "type": "string", "description": "Title for the notes post" },
+                    "content": { "type": "string", "description": "Notes content (supports Slack mrkdwn)" }
+                },
+                "required": ["channel", "title"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_salesforce_update".to_string(),
+            description: "Insert an interactive action block that lets the user update their Salesforce CRM. Supports logging meetings, adding notes, creating follow-up tasks, and updating opportunities. The user reviews and clicks to execute. Use when meeting content is relevant to sales pipeline or customer records.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "subject": { "type": "string", "description": "Meeting subject or note title" },
+                    "action_subtype": { "type": "string", "description": "Operation: log_meeting, add_note, create_task, update_opportunity (default: log_meeting)" },
+                    "body": { "type": "string", "description": "Description or note body" },
+                    "related_to_id": { "type": "string", "description": "Salesforce Account or Opportunity ID to link to" },
+                    "contact_ids": { "type": "array", "items": { "type": "string" }, "description": "Salesforce Contact IDs" },
+                    "start_time": { "type": "string", "description": "Meeting start (ISO 8601)" },
+                    "end_time": { "type": "string", "description": "Meeting end (ISO 8601)" },
+                    "due_date": { "type": "string", "description": "Task due date (ISO 8601 date)" },
+                    "opportunity_id": { "type": "string", "description": "Opportunity ID (for update_opportunity)" },
+                    "stage": { "type": "string", "description": "New opportunity stage" },
+                    "amount": { "type": "number", "description": "Deal amount" },
+                    "next_step": { "type": "string", "description": "Next step for the opportunity" }
+                },
+                "required": ["subject"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_hubspot_update".to_string(),
+            description: "Insert an interactive action block that lets the user update their HubSpot CRM. Supports logging meetings, adding notes, creating follow-up tasks, and updating deals. The user reviews and clicks to execute. Use when meeting content is relevant to sales pipeline or customer records.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "subject": { "type": "string", "description": "Meeting subject or note title" },
+                    "action_subtype": { "type": "string", "description": "Operation: log_meeting, add_note, create_task, update_deal (default: log_meeting)" },
+                    "body": { "type": "string", "description": "Description or note body" },
+                    "contact_ids": { "type": "array", "items": { "type": "string" }, "description": "HubSpot Contact IDs" },
+                    "company_ids": { "type": "array", "items": { "type": "string" }, "description": "HubSpot Company IDs" },
+                    "deal_ids": { "type": "array", "items": { "type": "string" }, "description": "HubSpot Deal IDs" },
+                    "start_time": { "type": "string", "description": "Meeting start (Unix timestamp ms)" },
+                    "end_time": { "type": "string", "description": "Meeting end (Unix timestamp ms)" },
+                    "due_date": { "type": "string", "description": "Task due date" },
+                    "deal_id": { "type": "string", "description": "Deal ID (for update_deal)" },
+                    "stage": { "type": "string", "description": "New deal stage" },
+                    "amount": { "type": "number", "description": "Deal amount" },
+                    "pipeline": { "type": "string", "description": "Pipeline ID" }
+                },
+                "required": ["subject"]
             }),
         },
     ]
