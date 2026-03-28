@@ -140,6 +140,15 @@ pub enum StreamEvent {
         result_preview: String,
         is_error: bool,
     },
+    /// A client-side tool call that must be forwarded to the connected client
+    /// (macOS app) for execution. The client returns a result via
+    /// `client_tool_result` WS message, which is routed back through the
+    /// `client_tool_bridge` to complete the tool execution.
+    ClientToolCall {
+        call_id: String,
+        tool_name: String,
+        input: serde_json::Value,
+    },
 }
 
 /// Trait for LLM drivers.

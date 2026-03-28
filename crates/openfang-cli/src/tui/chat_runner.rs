@@ -157,6 +157,9 @@ impl StandaloneChat {
             } => {
                 self.chat.tool_result(&name, &result_preview, is_error);
             }
+            StreamEvent::ClientToolCall { .. } => {
+                // Client-side tool calls are handled by the desktop app, not the CLI.
+            }
         }
     }
 

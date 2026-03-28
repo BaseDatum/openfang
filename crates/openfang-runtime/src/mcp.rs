@@ -37,7 +37,8 @@ pub struct McpServerConfig {
     /// Extra HTTP headers to send with every SSE / Streamable-HTTP request.
     /// Each entry is `"Header-Name: value"`.  Useful for authentication
     /// (`Authorization: Bearer <token>`), API keys (`X-Api-Key: ...`),
-    /// or any custom headers required by a remote MCP server.
+    /// identity headers (`X-Dialogue-User-Id`), or any custom headers
+    /// required by a remote MCP server or credential-injecting proxy.
     #[serde(default)]
     pub headers: Vec<String>,
 }
@@ -292,7 +293,7 @@ impl McpConnection {
 
         Self::check_ssrf(url)?;
 
-        // Parse custom headers (e.g., "Authorization: Bearer <token>").
+        // Parse custom headers (e.g., "Authorization: Bearer <token>", "X-Dialogue-User-Id: <value>").
         let mut custom_headers: HashMap<HeaderName, HeaderValue> = HashMap::new();
         for header_str in headers {
             if let Some((name, value)) = header_str.split_once(':') {

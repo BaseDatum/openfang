@@ -216,6 +216,10 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
             let ready = matches!(e.state, openfang_types::agent::AgentState::Running)
                 && auth_status != "missing";
 
+            let thinking_level = match &e.manifest.model.thinking {
+                None => "off",
+                Some(t) => t.level_name(),
+            };
             serde_json::json!({
                 "id": e.id.to_string(),
                 "name": e.name,
@@ -229,6 +233,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 "auth_status": auth_status,
                 "ready": ready,
                 "profile": e.manifest.profile,
+                "thinking_level": thinking_level,
                 "identity": {
                     "emoji": e.identity.emoji,
                     "avatar_url": e.identity.avatar_url,
@@ -346,11 +351,16 @@ pub async fn send_message(
     };
 
     // SECURITY: Reject oversized messages to prevent OOM / LLM token abuse.
-    const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB
-    if req.message.len() > MAX_MESSAGE_SIZE {
+    let max_message_size = state.kernel.config.max_message_bytes;
+    if req.message.len() > max_message_size {
+        let limit_display = if max_message_size >= 1_048_576 {
+            format!("{}MB", max_message_size / 1_048_576)
+        } else {
+            format!("{}KB", max_message_size / 1024)
+        };
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"error": "Message too large (max 64KB)"})),
+            Json(serde_json::json!({"error": format!("Message too large (max {limit_display})")})),
         );
     }
 
@@ -1405,11 +1415,16 @@ pub async fn send_message_stream(
     use openfang_runtime::llm_driver::StreamEvent;
 
     // SECURITY: Reject oversized messages to prevent OOM / LLM token abuse.
-    const MAX_MESSAGE_SIZE: usize = 64 * 1024; // 64KB
-    if req.message.len() > MAX_MESSAGE_SIZE {
+    let max_message_size = state.kernel.config.max_message_bytes;
+    if req.message.len() > max_message_size {
+        let limit_display = if max_message_size >= 1_048_576 {
+            format!("{}MB", max_message_size / 1_048_576)
+        } else {
+            format!("{}KB", max_message_size / 1024)
+        };
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"error": "Message too large (max 64KB)"})),
+            Json(serde_json::json!({"error": format!("Message too large (max {limit_display})")})),
         )
             .into_response();
     }
@@ -1434,14 +1449,18 @@ pub async fn send_message_stream(
     }
 
     let kernel_handle: Arc<dyn KernelHandle> = state.kernel.clone() as Arc<dyn KernelHandle>;
-    let (rx, _handle) = match state.kernel.send_message_streaming(
-        agent_id,
-        &req.message,
-        Some(kernel_handle),
-        req.sender_id,
-        req.sender_name,
-        None, // SSE streaming doesn't support image attachments yet
-    ) {
+    let (rx, _handle) = match state
+        .kernel
+        .send_message_streaming(
+            agent_id,
+            &req.message,
+            Some(kernel_handle),
+            req.sender_id,
+            req.sender_name,
+            None, // SSE streaming doesn't support image attachments yet
+        )
+        .await
+    {
         Ok(pair) => pair,
         Err(e) => {
             tracing::warn!("Streaming message failed for agent {id}: {e}");
@@ -4524,10 +4543,16 @@ pub async fn activate_hand(
                         entry.manifest.schedule,
                         openfang_types::agent::ScheduleMode::Reactive
                     ) {
+                        let tick_duration = entry
+                            .manifest
+                            .autonomous
+                            .as_ref()
+                            .map(|a| a.max_tick_duration_secs);
                         state.kernel.start_background_for_agent(
                             agent_id,
                             &entry.name,
                             &entry.manifest.schedule,
+                            tick_duration,
                         );
                     }
                 }
@@ -5779,6 +5804,7 @@ pub async fn patch_agent(
         if let Err(e) = state
             .kernel
             .set_agent_model(agent_id, model, explicit_provider)
+            .await
         {
             return (
                 StatusCode::BAD_REQUEST,
@@ -5854,7 +5880,7 @@ pub async fn security_status(State(state): State<Arc<AppState>>) -> impl IntoRes
             "websocket_limits": {
                 "max_per_ip": 5,
                 "idle_timeout_secs": 1800,
-                "max_message_size": 65536,
+                "max_message_size": state.kernel.config.max_message_bytes,
                 "max_messages_per_minute": 10
             },
             "wasm_sandbox": {
@@ -7034,6 +7060,7 @@ pub async fn set_model(
     match state
         .kernel
         .set_agent_model(agent_id, model, explicit_provider)
+        .await
     {
         Ok(()) => {
             // Return the resolved model+provider so frontend stays in sync.
@@ -7055,6 +7082,59 @@ pub async fn set_model(
                 Json(
                     serde_json::json!({"status": "ok", "model": resolved_model, "provider": resolved_provider}),
                 ),
+            )
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("{e}")})),
+        ),
+    }
+}
+
+/// PATCH /api/agents/{id}/thinking — Set extended thinking level for an agent.
+///
+/// Body: `{"thinking_level": "off" | "low" | "medium" | "high"}`
+///
+/// Levels map to `budget_tokens`:
+/// - `"off"` / `"none"` → disabled (None)
+/// - `"low"` → 1 500 tokens
+/// - `"medium"` → 10 000 tokens
+/// - `"high"` → 32 000 tokens
+pub async fn set_agent_thinking(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(body): Json<serde_json::Value>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+
+    let level = body["thinking_level"].as_str().unwrap_or("off");
+    let thinking = openfang_types::config::ThinkingConfig::from_level(level);
+
+    match state.kernel.set_agent_thinking(agent_id, thinking).await {
+        Ok(()) => {
+            let resolved_level = state
+                .kernel
+                .registry
+                .get(agent_id)
+                .map(|e| match &e.manifest.model.thinking {
+                    None => "off",
+                    Some(t) => t.level_name(),
+                })
+                .unwrap_or("off");
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "ok",
+                    "thinking_level": resolved_level,
+                })),
             )
         }
         Err(e) => (
@@ -7138,6 +7218,7 @@ pub async fn set_agent_tools(
     match state
         .kernel
         .set_agent_tool_filters(agent_id, allowlist, blocklist)
+        .await
     {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"status": "ok"}))),
         Err(e) => (
@@ -7216,7 +7297,7 @@ pub async fn set_agent_skills(
                 .collect()
         })
         .unwrap_or_default();
-    match state.kernel.set_agent_skills(agent_id, skills.clone()) {
+    match state.kernel.set_agent_skills(agent_id, skills.clone()).await {
         Ok(()) => (
             StatusCode::OK,
             Json(serde_json::json!({"status": "ok", "skills": skills})),
@@ -7304,6 +7385,7 @@ pub async fn set_agent_mcp_servers(
     match state
         .kernel
         .set_agent_mcp_servers(agent_id, servers.clone())
+        .await
     {
         Ok(()) => (
             StatusCode::OK,
@@ -8898,6 +8980,7 @@ pub async fn patch_agent_config(
                         state
                             .kernel
                             .set_agent_model(agent_id, new_model, Some(new_provider))
+                            .await
                     {
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
@@ -8906,7 +8989,7 @@ pub async fn patch_agent_config(
                     }
                 } else {
                     // Provider is empty string — resolve from catalog
-                    if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None) {
+                    if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None).await {
                         return (
                             StatusCode::INTERNAL_SERVER_ERROR,
                             Json(serde_json::json!({"error": format!("{e}")})),
@@ -8915,7 +8998,7 @@ pub async fn patch_agent_config(
                 }
             } else {
                 // No provider field at all — resolve from catalog
-                if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None) {
+                if let Err(e) = state.kernel.set_agent_model(agent_id, new_model, None).await {
                     return (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         Json(serde_json::json!({"error": format!("{e}")})),
@@ -11253,10 +11336,16 @@ pub async fn comms_send(
     }
 
     // SECURITY: Limit message size
-    if req.message.len() > 64 * 1024 {
+    let max_message_size = state.kernel.config.max_message_bytes;
+    if req.message.len() > max_message_size {
+        let limit_display = if max_message_size >= 1_048_576 {
+            format!("{}MB", max_message_size / 1_048_576)
+        } else {
+            format!("{}KB", max_message_size / 1024)
+        };
         return (
             StatusCode::PAYLOAD_TOO_LARGE,
-            Json(serde_json::json!({"error": "Message too large (max 64KB)"})),
+            Json(serde_json::json!({"error": format!("Message too large (max {limit_display})")})),
         );
     }
 
@@ -11488,6 +11577,85 @@ fn remove_toml_section(content: &str, section: &str) -> String {
         }
     }
     result
+}
+
+// ---------------------------------------------------------------------------
+// Cross-agent context search (Issue #13)
+// ---------------------------------------------------------------------------
+
+/// GET /api/context/search?query=...&agent_id=all&max_results=5&time_window_minutes=30
+///
+/// Search across agent context windows and memories with a text query.
+pub async fn context_search(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<ContextSearchQuery>,
+) -> impl IntoResponse {
+    let kernel: &Arc<OpenFangKernel> = &state.kernel;
+    match kernel
+        .search_agent_context(
+            &params.agent_id,
+            &params.query,
+            params.max_results.min(50),
+            params.time_window_minutes,
+        )
+        .await
+    {
+        Ok(results) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "query": params.query,
+                "agent_id": params.agent_id,
+                "results": results,
+                "count": results.len(),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+/// GET /api/agents/:id/context?max_messages=10&time_window_minutes=30
+///
+/// Get recent conversation context from a specific agent's session.
+pub async fn get_agent_context(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(params): Query<ContextGetQuery>,
+) -> impl IntoResponse {
+    let kernel: &Arc<OpenFangKernel> = &state.kernel;
+    match kernel
+        .get_agent_context(
+            &id,
+            params.max_messages.min(100),
+            params.time_window_minutes,
+        )
+        .await
+    {
+        Ok(results) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "agent_id": id,
+                "messages": results,
+                "count": results.len(),
+            })),
+        ),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": e})),
+        ),
+    }
+}
+
+/// GET /api/context/agents — List active agents with context summaries.
+pub async fn context_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let kernel: &Arc<OpenFangKernel> = &state.kernel;
+    let agents = kernel.list_active_agents_with_context();
+    Json(serde_json::json!({
+        "agents": agents,
+        "count": agents.len(),
+    }))
 }
 
 #[cfg(test)]

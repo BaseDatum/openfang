@@ -225,7 +225,9 @@ pub fn build_reload_plan(old: &KernelConfig, new: &KernelConfig) -> ReloadPlan {
         plan.hot_actions.push(HotAction::ReloadExtensions);
     }
 
-    if field_changed(&old.mcp_servers, &new.mcp_servers) {
+    if field_changed(&old.mcp_servers, &new.mcp_servers)
+        || field_changed(&old.mcp_auth.enabled, &new.mcp_auth.enabled)
+    {
         plan.hot_actions.push(HotAction::ReloadMcpServers);
     }
 

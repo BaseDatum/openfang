@@ -59,6 +59,13 @@ pub struct PromptContext {
     pub sender_id: Option<String>,
     /// Sender display name.
     pub sender_name: Option<String>,
+    /// Whether Programmatic Tool Calling is enabled for this agent.
+    /// When true, the `## Your Tools` section is omitted — tool information
+    /// is provided via the `execute_code` tool description instead.
+    pub ptc_enabled: bool,
+    /// Memory backend type ("sqlite" or "hindsight").
+    /// Controls the memory section guidance in the system prompt.
+    pub memory_backend: String,
 }
 
 /// Build the complete system prompt from a `PromptContext`.
@@ -77,8 +84,9 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         sections.push(format!("## Current Date\nToday is {date}."));
     }
 
-    // Section 2 — Tool Call Behavior (skip for subagents)
-    if !ctx.is_subagent {
+    // Section 2 — Tool Call Behavior (skip for subagents and PTC agents —
+    // PTC agents get their own behavioral guidance in the PTC supplement)
+    if !ctx.is_subagent && !ctx.ptc_enabled {
         sections.push(TOOL_CALL_BEHAVIOR.to_string());
     }
 
@@ -91,14 +99,17 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         }
     }
 
-    // Section 3 — Available Tools (always present if tools exist)
-    let tools_section = build_tools_section(&ctx.granted_tools);
-    if !tools_section.is_empty() {
-        sections.push(tools_section);
+    // Section 3 — Available Tools (skip when PTC is enabled — tools are listed
+    // as Python function signatures in the execute_code tool description instead)
+    if !ctx.ptc_enabled {
+        let tools_section = build_tools_section(&ctx.granted_tools);
+        if !tools_section.is_empty() {
+            sections.push(tools_section);
+        }
     }
 
     // Section 4 — Memory Protocol (always present)
-    let mem_section = build_memory_section(&ctx.recalled_memories);
+    let mem_section = build_memory_section(&ctx.recalled_memories, &ctx.memory_backend);
     sections.push(mem_section);
 
     // Section 5 — Skills (only if skills available)
@@ -109,8 +120,9 @@ pub fn build_system_prompt(ctx: &PromptContext) -> String {
         ));
     }
 
-    // Section 6 — MCP Servers (only if summary present)
-    if !ctx.mcp_summary.is_empty() {
+    // Section 6 — MCP Servers (skip when PTC is enabled — MCP tools are listed
+    // as Python functions in the execute_code tool description instead)
+    if !ctx.ptc_enabled && !ctx.mcp_summary.is_empty() {
         sections.push(build_mcp_section(&ctx.mcp_summary));
     }
 
@@ -287,19 +299,18 @@ pub fn build_canonical_context_message(ctx: &PromptContext) -> Option<String> {
 /// Build the memory section (Section 4).
 ///
 /// Also used by `agent_loop.rs` to append recalled memories after DB lookup.
-pub fn build_memory_section(memories: &[(String, String)]) -> String {
+pub fn build_memory_section(memories: &[(String, String)], backend: &str) -> String {
     let mut out = String::from("## Memory\n");
-    if memories.is_empty() {
-        out.push_str(
-            "- When the user asks about something from a previous conversation, use memory_recall first.\n\
-             - Store important preferences, decisions, and context with memory_store for future use.",
-        );
+
+    if backend == "hindsight" {
+        // Hindsight semantic memory — richer guidance for the LLM-powered backend.
+        out.push_str(HINDSIGHT_MEMORY_GUIDANCE);
     } else {
-        out.push_str(
-            "- Use the recalled memories below to inform your responses.\n\
-             - Only call memory_recall if you need information not already shown here.\n\
-             - Store important preferences, decisions, and context with memory_store for future use.",
-        );
+        // Default SQLite memory — simple KV guidance.
+        out.push_str(SQLITE_MEMORY_GUIDANCE);
+    }
+
+    if !memories.is_empty() {
         out.push_str("\n\nRecalled memories:\n");
         for (key, content) in memories.iter().take(5) {
             let capped = cap_str(content, 500);
@@ -310,8 +321,54 @@ pub fn build_memory_section(memories: &[(String, String)]) -> String {
             }
         }
     }
+
     out
 }
+
+/// Memory guidance for Hindsight semantic memory backend.
+const HINDSIGHT_MEMORY_GUIDANCE: &str = "\
+You have two memory systems: a **key-value store** and a **semantic memory system**. They serve different purposes.
+
+### Key-Value Store (memory_store / memory_recall)
+Exact-key structured storage. Use for data you need to retrieve by a known key.
+- `memory_store(key, value)` writes to a local KV store. Retrieval is by **exact key only** — not searchable semantically.
+- `memory_recall(key)` retrieves by exact key. Returns null if the key doesn't exist.
+- Good for: settings, config, structured state (e.g. `memory_store(\"user_timezone\", \"Europe/Lisbon\")`).
+- **KV data is invisible to semantic search.** If you store something in KV and later need to find it without knowing the key, you won't.
+
+### Semantic Memory (automatic + memory_retain)
+Your conversation history is automatically stored in a semantic memory system. Every interaction is retained, processed into structured facts, and searchable by meaning.
+- The system automatically remembers what you discuss with the user — no action needed.
+- `memory_retain(content, context?, tags?, metadata?, timestamp?)` — explicitly store an important fact. Use for key information you want to emphasize or information from external sources that won't appear in conversation naturally.
+- Entities and relationships are automatically extracted and tracked.
+- The system consolidates redundant memories and builds evolving mental models over time.
+
+### Reflect (memory_reflect)
+Synthesized reasoning across all stored memories.
+- `memory_reflect(query, budget?)` — ask a question and get a thoughtful analysis that reasons across everything known about the user.
+- Use for: \"what patterns have emerged in my work\", \"what approach would suit me best\", \"how should I prioritize these tasks\".
+- Different from recall (raw fact lookup) — reflect thinks through the answer.
+- Budget: \"low\" (quick), \"mid\" (moderate), \"high\" (thorough). Default: \"low\".
+
+### Knowledge Graph (knowledge_add_entity, knowledge_add_relation, knowledge_query)
+Explicit structured facts stored as rich semantic memories. Use for important entities and relationships you want to track.
+- `knowledge_add_entity(entity_type: \"person\", name: \"Sky\", properties: {timezone: \"Europe/Lisbon\", role: \"Founder\"})` — include ALL known properties.
+- `knowledge_add_relation(source: \"Sky\", relation: \"founder_of\", target: \"Dialogue\")` — explicit relationships between entities.
+- `knowledge_query(source: \"Sky\")` — find entities and relations by name.
+- These are stored as rich semantic facts, so they also appear in semantic recall.
+
+### Best Practices
+- Conversations are auto-retained — don't use `memory_retain` to re-store what was just said.
+- Use `memory_retain` for facts from external sources (files, web searches, tool outputs) that the user wants remembered.
+- Use `memory_reflect` before giving advice that should account for the user's history and preferences.
+- Store knowledge graph entities proactively for people, projects, and key facts.
+- Don't store the same information repeatedly — the system consolidates and deduplicates automatically.
+- When the user corrects information, the correction naturally supersedes older memories over time.";
+
+/// Memory guidance for the default SQLite KV backend.
+const SQLITE_MEMORY_GUIDANCE: &str = "\
+- When the user asks about something from a previous conversation, use memory_recall first.
+- Store important preferences, decisions, and context with memory_store for future use.";
 
 fn build_skills_section(skill_summary: &str, prompt_context: &str) -> String {
     let mut out = String::from("## Skills\n");
@@ -753,11 +810,21 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_section_empty() {
-        let section = build_memory_section(&[]);
+    fn test_memory_section_empty_sqlite() {
+        let section = build_memory_section(&[], "sqlite");
         assert!(section.contains("## Memory"));
         assert!(section.contains("use memory_recall first"));
         assert!(!section.contains("Recalled memories"));
+    }
+
+    #[test]
+    fn test_memory_section_empty_hindsight() {
+        let section = build_memory_section(&[], "hindsight");
+        assert!(section.contains("## Memory"));
+        assert!(section.contains("semantic memory system"));
+        assert!(section.contains("knowledge_add_entity"));
+        assert!(section.contains("Key-Value Store"));
+        assert!(section.contains("invisible to semantic search"));
     }
 
     #[test]
@@ -766,12 +833,10 @@ mod tests {
             ("pref".to_string(), "User likes dark mode".to_string()),
             ("ctx".to_string(), "Working on Rust project".to_string()),
         ];
-        let section = build_memory_section(&memories);
+        let section = build_memory_section(&memories, "sqlite");
         assert!(section.contains("Recalled memories"));
         assert!(section.contains("[pref] User likes dark mode"));
         assert!(section.contains("[ctx] Working on Rust project"));
-        assert!(section.contains("Use the recalled memories below"));
-        assert!(!section.contains("use memory_recall first"));
     }
 
     #[test]
@@ -779,7 +844,7 @@ mod tests {
         let memories: Vec<(String, String)> = (0..10)
             .map(|i| (format!("k{i}"), format!("value {i}")))
             .collect();
-        let section = build_memory_section(&memories);
+        let section = build_memory_section(&memories, "sqlite");
         assert!(section.contains("[k0]"));
         assert!(section.contains("[k4]"));
         assert!(!section.contains("[k5]"));
@@ -789,7 +854,7 @@ mod tests {
     fn test_memory_content_capped() {
         let long_content = "x".repeat(1000);
         let memories = vec![("k".to_string(), long_content)];
-        let section = build_memory_section(&memories);
+        let section = build_memory_section(&memories, "sqlite");
         // Should be capped at 500 + "..."
         assert!(section.contains("..."));
         assert!(section.len() < 1200);

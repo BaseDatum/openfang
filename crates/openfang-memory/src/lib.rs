@@ -17,5 +17,8 @@ pub mod session;
 pub mod structured;
 pub mod usage;
 
+#[cfg(feature = "hindsight")]
+pub mod hindsight;
+
 mod substrate;
 pub use substrate::MemorySubstrate;

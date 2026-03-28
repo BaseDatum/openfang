@@ -298,6 +298,9 @@ pub struct HandAgentConfig {
     /// making long LLM calls. Omit to use the kernel default.
     #[serde(default)]
     pub heartbeat_interval_secs: Option<u64>,
+    /// Maximum wall-clock seconds for a single background tick (default: 300).
+    #[serde(default)]
+    pub max_tick_duration: Option<u64>,
 }
 
 fn default_module() -> String {

@@ -26,7 +26,7 @@ use openfang_types::agent::AgentId;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Mutex;
@@ -299,7 +299,26 @@ async fn handle_agent_ws(
     // Track last activity for idle timeout
     let mut last_activity = std::time::Instant::now();
 
-    // Main message loop with idle timeout
+    // Subscribe to client tool call broadcasts from the kernel.
+    // When an agent calls a client-side tool, the kernel broadcasts it
+    // and we forward it to the connected client over this WS.
+    let mut client_tool_rx = state.kernel.client_tool_tx.subscribe();
+
+    // Track whether a "message" type request is being processed.
+    // This prevents concurrent agent invocations from the same connection
+    // and allows the receive loop to stay responsive for Ping/Pong frames.
+    let processing = Arc::new(AtomicBool::new(false));
+
+    // Track the spawned message task so we can abort it on disconnect.
+    let mut message_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    // Main message loop with idle timeout.
+    //
+    // IMPORTANT: This loop must NOT block on long-running operations.
+    // Agent message processing is spawned as a background task so the
+    // receiver stays responsive to WebSocket Ping frames. Without this,
+    // upstream proxies (load balancers, reverse proxies) that send pings
+    // would kill the connection mid-response because the pong never arrives.
     loop {
         let msg = tokio::select! {
             msg = receiver.next() => {
@@ -307,6 +326,19 @@ async fn handle_agent_ws(
                     Some(m) => m,
                     None => break, // Stream ended
                 }
+            }
+            // Forward client tool calls from the kernel to the connected client.
+            // Only forward calls targeting THIS agent to prevent duplicate
+            // execution when multiple agents (e.g. meeting-processor + EA)
+            // are connected simultaneously.
+            tool_call = client_tool_rx.recv() => {
+                if let Ok(payload) = tool_call {
+                    let target = payload["agent_id"].as_str().unwrap_or("");
+                    if target.is_empty() || target == id_str {
+                        let _ = send_json(&sender, &payload).await;
+                    }
+                }
+                continue; // Not a WS message — go back to waiting
             }
             _ = tokio::time::sleep(WS_IDLE_TIMEOUT.saturating_sub(last_activity.elapsed())) => {
                 info!(agent_id = %id_str, "WebSocket idle timeout (30 min)");
@@ -333,14 +365,19 @@ async fn handle_agent_ws(
             Message::Text(text) => {
                 last_activity = std::time::Instant::now();
 
-                // SECURITY: Reject oversized WebSocket messages (64KB max)
-                const MAX_WS_MSG_SIZE: usize = 64 * 1024;
-                if text.len() > MAX_WS_MSG_SIZE {
+                // SECURITY: Reject oversized WebSocket messages (configurable, default 1MB)
+                let max_msg_size = state.kernel.config.max_message_bytes;
+                if text.len() > max_msg_size {
+                    let limit_display = if max_msg_size >= 1_048_576 {
+                        format!("{}MB", max_msg_size / 1_048_576)
+                    } else {
+                        format!("{}KB", max_msg_size / 1024)
+                    };
                     let _ = send_json(
                         &sender,
                         &serde_json::json!({
                             "type": "error",
-                            "content": "Message too large (max 64KB)",
+                            "content": format!("Message too large (max {limit_display})"),
                         }),
                     )
                     .await;
@@ -363,7 +400,116 @@ async fn handle_agent_ws(
                 }
                 msg_times.push(now);
 
-                handle_text_message(&sender, &state, agent_id, &text, &verbose).await;
+                // Pre-parse message type to route lightweight messages inline
+                // and spawn heavyweight (agent loop) messages in the background.
+                let msg_type = serde_json::from_str::<serde_json::Value>(&text)
+                    .ok()
+                    .and_then(|v| v.get("type").and_then(|t| t.as_str()).map(String::from))
+                    .unwrap_or_else(|| "message".to_string());
+
+                match msg_type.as_str() {
+                    // Fast path: application-level pings handled inline
+                    "ping" => {
+                        let _ = send_json(
+                            &sender,
+                            &serde_json::json!({"type": "pong"}),
+                        )
+                        .await;
+                    }
+                    // Fast path: client tool results from the macOS/iOS app.
+                    // Route back to the kernel's pending call map.
+                    "client_tool_result" => {
+                        if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&text) {
+                            if let (Some(call_id), Some(result), Some(is_error)) = (
+                                parsed["call_id"].as_str(),
+                                parsed["result"].as_str(),
+                                parsed["is_error"].as_bool(),
+                            ) {
+                                let resolved = state.kernel.resolve_client_tool(
+                                    call_id,
+                                    result.to_string(),
+                                    is_error,
+                                );
+                                if !resolved {
+                                    tracing::warn!(
+                                        call_id,
+                                        "Received client_tool_result for unknown call_id"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    // Cancel: abort the running agent task immediately.
+                    // Handled inline (not spawned) so it works while busy.
+                    "cancel" => {
+                        let cancelled = state.kernel.stop_agent_run(agent_id).unwrap_or(false);
+                        if cancelled {
+                            processing.store(false, Ordering::Relaxed);
+                            // Abort the spawned message task so it stops sending events
+                            if let Some(task) = message_task.take() {
+                                task.abort();
+                            }
+                            let _ = send_json(
+                                &sender,
+                                &serde_json::json!({
+                                    "type": "typing", "state": "stop",
+                                }),
+                            ).await;
+                            let _ = send_json(
+                                &sender,
+                                &serde_json::json!({
+                                    "type": "cancelled",
+                                    "message": "Run cancelled.",
+                                }),
+                            ).await;
+                            info!(agent_id = %id_str, "Agent run cancelled via WS cancel message");
+                        } else {
+                            let _ = send_json(
+                                &sender,
+                                &serde_json::json!({
+                                    "type": "cancelled",
+                                    "message": "No active run to cancel.",
+                                }),
+                            ).await;
+                        }
+                    }
+                    // Commands (/stop, /model, /compact, etc.) run inline.
+                    // This is intentional: /stop must work while the agent is
+                    // processing, and other commands are fast enough not to
+                    // block the receive loop for a problematic duration.
+                    "command" => {
+                        handle_text_message(&sender, &state, agent_id, &text, &verbose)
+                            .await;
+                    }
+                    // "message" and unknown types: spawn as a background task
+                    // so the receive loop stays responsive to WS Ping frames.
+                    _ => {
+                        if processing.load(Ordering::Relaxed) {
+                            let _ = send_json(
+                                &sender,
+                                &serde_json::json!({
+                                    "type": "error",
+                                    "content": "Agent is busy processing a message. Please wait.",
+                                }),
+                            )
+                            .await;
+                            continue;
+                        }
+
+                        processing.store(true, Ordering::Relaxed);
+                        let sender_c = Arc::clone(&sender);
+                        let state_c = Arc::clone(&state);
+                        let verbose_c = Arc::clone(&verbose);
+                        let processing_c = Arc::clone(&processing);
+                        message_task = Some(tokio::spawn(async move {
+                            handle_text_message(
+                                &sender_c, &state_c, agent_id, &text, &verbose_c,
+                            )
+                            .await;
+                            processing_c.store(false, Ordering::Relaxed);
+                        }));
+                    }
+                }
             }
             Message::Close(_) => {
                 info!(agent_id = %id_str, "WebSocket closed by client");
@@ -380,6 +526,9 @@ async fn handle_agent_ws(
 
     // Cleanup
     update_handle.abort();
+    if let Some(task) = message_task {
+        task.abort();
+    }
     info!(agent_id = %id_str, "WebSocket disconnected");
 }
 
@@ -499,14 +648,18 @@ async fn handle_text_message(
             // Send message to agent with streaming
             let kernel_handle: Arc<dyn KernelHandle> =
                 state.kernel.clone() as Arc<dyn KernelHandle>;
-            match state.kernel.send_message_streaming(
-                agent_id,
-                &content,
-                Some(kernel_handle),
-                None,
-                None,
-                ws_content_blocks,
-            ) {
+            match state
+                .kernel
+                .send_message_streaming(
+                    agent_id,
+                    &content,
+                    Some(kernel_handle),
+                    None,
+                    None,
+                    ws_content_blocks,
+                )
+                .await
+            {
                 Ok((mut rx, handle)) => {
                     // Forward stream events to WebSocket with debouncing.
                     //
@@ -848,7 +1001,7 @@ async fn handle_command(
                     serde_json::json!({"type": "error", "content": "Agent not found"})
                 }
             } else {
-                match state.kernel.set_agent_model(agent_id, args, None) {
+                match state.kernel.set_agent_model(agent_id, args, None).await {
                     Ok(()) => {
                         if let Some(entry) = state.kernel.registry.get(agent_id) {
                             let model = &entry.manifest.model.model;
@@ -1084,6 +1237,16 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
             "type": "phase",
             "phase": phase,
             "detail": detail,
+        })),
+        StreamEvent::ClientToolCall {
+            call_id,
+            tool_name,
+            input,
+        } => Some(serde_json::json!({
+            "type": "client_tool_call",
+            "call_id": call_id,
+            "tool": tool_name,
+            "input": input,
         })),
         _ => None, // Skip ToolInputDelta, ContentComplete
     }

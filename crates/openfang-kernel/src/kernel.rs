@@ -38,7 +38,7 @@ use openfang_types::tool::ToolDefinition;
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, OnceLock, Weak};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 /// The main OpenFang kernel — coordinates all subsystems.
 /// Stub LLM driver used when no providers are configured.
@@ -161,6 +161,13 @@ pub struct OpenFangKernel {
     agent_msg_locks: dashmap::DashMap<AgentId, Arc<tokio::sync::Mutex<()>>>,
     /// Weak self-reference for trigger dispatch (set after Arc wrapping).
     self_handle: OnceLock<Weak<OpenFangKernel>>,
+    /// Pending client-side tool calls awaiting results from the connected client.
+    /// Key: call_id, Value: oneshot sender for (content, is_error).
+    pub client_tool_pending:
+        dashmap::DashMap<String, tokio::sync::oneshot::Sender<(String, bool)>>,
+    /// Broadcast channel for outbound client tool calls. The WS handler subscribes
+    /// to this and forwards calls to the connected client.
+    pub client_tool_tx: tokio::sync::broadcast::Sender<serde_json::Value>,
 }
 
 /// Bounded in-memory delivery receipt tracker.
@@ -561,10 +568,46 @@ impl OpenFangKernel {
             .sqlite_path
             .clone()
             .unwrap_or_else(|| config.data_dir.join("openfang.db"));
-        let memory = Arc::new(
-            MemorySubstrate::open(&db_path, config.memory.decay_rate, &config.memory)
-                .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?,
-        );
+        let mut substrate = MemorySubstrate::open(&db_path, config.memory.decay_rate, &config.memory)
+            .map_err(|e| KernelError::BootFailed(format!("Memory init failed: {e}")))?;
+
+        // Optionally enable the Hindsight backend for semantic memory.
+        #[cfg(feature = "hindsight")]
+        if config.memory.backend == "hindsight" {
+            let url = config
+                .memory
+                .hindsight_url
+                .as_deref()
+                .ok_or_else(|| {
+                    KernelError::BootFailed(
+                        "memory.backend = \"hindsight\" but memory.hindsight_url is not set"
+                            .to_string(),
+                    )
+                })?;
+
+            let auth_token = config
+                .memory
+                .hindsight_auth_env
+                .as_deref()
+                .and_then(|env_name| std::env::var(env_name).ok())
+                .ok_or_else(|| {
+                    KernelError::BootFailed(format!(
+                        "memory.backend = \"hindsight\" but env var {:?} is not set",
+                        config.memory.hindsight_auth_env
+                    ))
+                })?;
+
+            info!(
+                url = %url,
+                auth_env = config.memory.hindsight_auth_env.as_deref().unwrap_or("?"),
+                "Enabling Hindsight semantic memory backend"
+            );
+            let backend =
+                openfang_memory::hindsight::HindsightBackend::new(url, &auth_token);
+            substrate = substrate.with_hindsight(backend);
+        }
+
+        let memory = Arc::new(substrate);
 
         // Initialize credential resolver (vault → dotenv → env var)
         let credential_resolver = {
@@ -846,10 +889,17 @@ impl OpenFangKernel {
             ),
         };
 
-        // Auto-detect embedding driver for vector similarity search
+        // Auto-detect embedding driver for vector similarity search.
+        // When Hindsight is the memory backend, embeddings are handled
+        // server-side — skip local embedding driver entirely so the
+        // agent loop falls through to `memory.recall()` / `memory.remember()`
+        // which route through Hindsight.
         let embedding_driver: Option<
             Arc<dyn openfang_runtime::embedding::EmbeddingDriver + Send + Sync>,
-        > = {
+        > = if config.memory.backend == "hindsight" {
+            info!("Hindsight backend active — skipping local embedding driver (embeddings handled server-side)");
+            None
+        } else {
             use openfang_runtime::embedding::create_embedding_driver;
             let configured_model = &config.memory.embedding_model;
             if let Some(ref provider) = config.memory.embedding_provider {
@@ -1049,6 +1099,8 @@ impl OpenFangKernel {
             default_model_override: std::sync::RwLock::new(None),
             agent_msg_locks: dashmap::DashMap::new(),
             self_handle: OnceLock::new(),
+            client_tool_pending: dashmap::DashMap::new(),
+            client_tool_tx: tokio::sync::broadcast::channel(32).0,
         };
 
         // Restore persisted agents from SQLite
@@ -1384,6 +1436,7 @@ impl OpenFangKernel {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: None,
         };
         self.registry
             .register(entry.clone())
@@ -1626,7 +1679,7 @@ impl OpenFangKernel {
     ///
     /// WASM and Python agents don't support true streaming — they execute
     /// synchronously and emit a single `TextDelta` + `ContentComplete` pair.
-    pub fn send_message_streaming(
+    pub async fn send_message_streaming(
         self: &Arc<Self>,
         agent_id: AgentId,
         message: &str,
@@ -1702,17 +1755,27 @@ impl OpenFangKernel {
         }
 
         // LLM agent: true streaming via agent loop
-        let mut session = self
-            .memory
-            .get_session(entry.session_id)
-            .map_err(KernelError::OpenFang)?
-            .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
-                agent_id,
-                messages: Vec::new(),
-                context_window_tokens: 0,
-                label: None,
-            });
+        //
+        // Try the in-memory session cache first (populated after the previous
+        // agent loop). Falls back to SQLite via spawn_blocking when the cache
+        // is cold (first call, after session switch, etc.).
+        let mut session = if let Some(cached) = self.registry.take_session_cache(agent_id) {
+            std::sync::Arc::try_unwrap(cached).unwrap_or_else(|arc| (*arc).clone())
+        } else {
+            let memory = Arc::clone(&self.memory);
+            let sid = entry.session_id;
+            tokio::task::spawn_blocking(move || memory.get_session(sid))
+                .await
+                .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(format!("spawn_blocking join: {e}"))))?
+                .map_err(KernelError::OpenFang)?
+                .unwrap_or_else(|| openfang_memory::session::Session {
+                    id: sid,
+                    agent_id,
+                    messages: Vec::new(),
+                    context_window_tokens: 0,
+                    label: None,
+                })
+        };
 
         // Check if auto-compaction is needed: message-count OR token-count OR quota-headroom trigger
         let needs_compact = {
@@ -1804,16 +1867,12 @@ impl OpenFangKernel {
         let tools = self.available_tools_with_registry(agent_id, Some(&skill_snapshot));
         let tools = entry.mode.filter_tools(tools);
 
-        // Build the structured system prompt via prompt_builder
+        // Build the structured system prompt via prompt_builder.
         {
+            use openfang_types::agent::PromptCache;
+            const CACHE_TTL_SECS: i64 = 3600; // 1 hour — identity files rarely change
+
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
-            let shared_id = shared_memory_agent_id();
-            let user_name = self
-                .memory
-                .structured_get(shared_id, "user_name")
-                .ok()
-                .flatten()
-                .and_then(|v| v.as_str().map(String::from));
 
             let peer_agents: Vec<(String, String, String)> = self
                 .registry
@@ -1827,6 +1886,70 @@ impl OpenFangKernel {
                     )
                 })
                 .collect();
+
+            // Check if the agent has a fresh prompt cache.
+            let cached = entry
+                .prompt_cache
+                .as_ref()
+                .filter(|c| {
+                    (chrono::Utc::now() - c.refreshed_at).num_seconds() < CACHE_TTL_SECS
+                })
+                .cloned();
+
+            // If stale or absent, refresh in a blocking thread and store back.
+            let pcache = if let Some(c) = cached {
+                c
+            } else {
+                let workspace = manifest.workspace.clone();
+                let is_autonomous = manifest.autonomous.is_some();
+                let fresh = tokio::task::spawn_blocking(move || {
+                    let ws = workspace.as_deref();
+                    Arc::new(PromptCache {
+                        soul_md: ws.and_then(|w| read_identity_file(w, "SOUL.md")),
+                        user_md: ws.and_then(|w| read_identity_file(w, "USER.md")),
+                        memory_md: ws.and_then(|w| read_identity_file(w, "MEMORY.md")),
+                        agents_md: ws.and_then(|w| read_identity_file(w, "AGENTS.md")),
+                        bootstrap_md: ws.and_then(|w| read_identity_file(w, "BOOTSTRAP.md")),
+                        identity_md: ws.and_then(|w| read_identity_file(w, "IDENTITY.md")),
+                        heartbeat_md: if is_autonomous {
+                            ws.and_then(|w| read_identity_file(w, "HEARTBEAT.md"))
+                        } else {
+                            None
+                        },
+                        workspace_context: ws.map(|w| {
+                            let mut ws_ctx =
+                                openfang_runtime::workspace_context::WorkspaceContext::detect(w);
+                            ws_ctx.build_context_section()
+                        }),
+                        refreshed_at: chrono::Utc::now(),
+                    })
+                })
+                .await
+                .unwrap_or_else(|_| Arc::new(PromptCache::default()));
+                // Store back on the registry for subsequent calls.
+                self.registry.set_prompt_cache(agent_id, Arc::clone(&fresh));
+                fresh
+            };
+
+            // Canonical context + user name: small SQLite reads, still over FUSE.
+            let (canonical_context, user_name) = {
+                let memory = Arc::clone(&self.memory);
+                let shared_id = shared_memory_agent_id();
+                tokio::task::spawn_blocking(move || {
+                    let cc = memory
+                        .canonical_context(agent_id, None)
+                        .ok()
+                        .and_then(|(s, _)| s);
+                    let un = memory
+                        .structured_get(shared_id, "user_name")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.as_str().map(String::from));
+                    (cc, un)
+                })
+                .await
+                .unwrap_or((None, None))
+            };
 
             let prompt_ctx = openfang_runtime::prompt_builder::PromptContext {
                 agent_name: manifest.name.clone(),
@@ -1845,23 +1968,10 @@ impl OpenFangKernel {
                     String::new()
                 },
                 workspace_path: manifest.workspace.as_ref().map(|p| p.display().to_string()),
-                soul_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "SOUL.md")),
-                user_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "USER.md")),
-                memory_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "MEMORY.md")),
-                canonical_context: self
-                    .memory
-                    .canonical_context(agent_id, None)
-                    .ok()
-                    .and_then(|(s, _)| s),
+                soul_md: pcache.soul_md.clone(),
+                user_md: pcache.user_md.clone(),
+                memory_md: pcache.memory_md.clone(),
+                canonical_context,
                 user_name,
                 channel_type: None,
                 is_subagent: manifest
@@ -1870,31 +1980,11 @@ impl OpenFangKernel {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false),
                 is_autonomous: manifest.autonomous.is_some(),
-                agents_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "AGENTS.md")),
-                bootstrap_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "BOOTSTRAP.md")),
-                workspace_context: manifest.workspace.as_ref().map(|w| {
-                    let mut ws_ctx =
-                        openfang_runtime::workspace_context::WorkspaceContext::detect(w);
-                    ws_ctx.build_context_section()
-                }),
-                identity_md: manifest
-                    .workspace
-                    .as_ref()
-                    .and_then(|w| read_identity_file(w, "IDENTITY.md")),
-                heartbeat_md: if manifest.autonomous.is_some() {
-                    manifest
-                        .workspace
-                        .as_ref()
-                        .and_then(|w| read_identity_file(w, "HEARTBEAT.md"))
-                } else {
-                    None
-                },
+                agents_md: pcache.agents_md.clone(),
+                bootstrap_md: pcache.bootstrap_md.clone(),
+                workspace_context: pcache.workspace_context.clone(),
+                identity_md: pcache.identity_md.clone(),
+                heartbeat_md: pcache.heartbeat_md.clone(),
                 peer_agents,
                 current_date: Some(
                     chrono::Local::now()
@@ -1903,6 +1993,8 @@ impl OpenFangKernel {
                 ),
                 sender_id,
                 sender_name,
+                ptc_enabled: manifest.ptc_enabled.unwrap_or(self.config.ptc.enabled),
+                memory_backend: self.config.memory.backend.clone(),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -1916,6 +2008,13 @@ impl OpenFangKernel {
                     serde_json::Value::String(cc_msg),
                 );
             }
+
+            // Store memory backend in metadata so agent_loop can access it
+            // for memory section injection on recall.
+            manifest.metadata.insert(
+                "memory_backend".to_string(),
+                serde_json::Value::String(self.config.memory.backend.clone()),
+            );
         }
 
         let memory = Arc::clone(&self.memory);
@@ -2018,23 +2117,47 @@ impl OpenFangKernel {
 
             match result {
                 Ok(result) => {
-                    // Append new messages to canonical session for cross-channel memory
-                    if session.messages.len() > messages_before {
-                        let new_messages = session.messages[messages_before..].to_vec();
-                        if let Err(e) = memory.append_canonical(agent_id, &new_messages, None) {
-                            warn!(agent_id = %agent_id, "Failed to update canonical session (streaming): {e}");
-                        }
-                    }
+                    // Cache the mutated session in memory so the next call
+                    // can skip the FUSE/SQLite round-trip. The background
+                    // persist below is purely for durability.
+                    kernel_clone.registry.set_session_cache(
+                        agent_id,
+                        std::sync::Arc::new(session.clone()),
+                    );
 
-                    // Write JSONL session mirror to workspace
-                    if let Some(ref workspace) = manifest.workspace {
-                        if let Err(e) =
-                            memory.write_jsonl_mirror(&session, &workspace.join("sessions"))
-                        {
-                            warn!("Failed to write JSONL session mirror (streaming): {e}");
-                        }
-                        // Append daily memory log (best-effort)
-                        append_daily_memory_log(workspace, &result.response);
+                    // Post-processing I/O: save session, append canonical,
+                    // write JSONL mirror, and daily memory log. All hit the
+                    // FUSE filesystem, so run in spawn_blocking to avoid
+                    // starving the tokio runtime.
+                    {
+                        let mem = Arc::clone(&memory);
+                        let sess = session.clone();
+                        let ws = manifest.workspace.clone();
+                        let response_text = result.response.clone();
+                        let aid = agent_id;
+                        let msgs_before = messages_before;
+                        let _ = tokio::task::spawn_blocking(move || {
+                            // Persist session to SQLite (durability; the in-memory
+                            // cache is authoritative for the next call).
+                            if let Err(e) = mem.save_session(&sess) {
+                                warn!(agent_id = %aid, "Background session save failed (streaming): {e}");
+                            }
+                            if sess.messages.len() > msgs_before {
+                                let new_messages = sess.messages[msgs_before..].to_vec();
+                                if let Err(e) = mem.append_canonical(aid, &new_messages, None) {
+                                    warn!(agent_id = %aid, "Failed to update canonical session (streaming): {e}");
+                                }
+                            }
+                            if let Some(ref workspace) = ws {
+                                if let Err(e) =
+                                    mem.write_jsonl_mirror(&sess, &workspace.join("sessions"))
+                                {
+                                    warn!("Failed to write JSONL session mirror (streaming): {e}");
+                                }
+                                append_daily_memory_log(workspace, &response_text);
+                            }
+                        })
+                        .await;
                     }
 
                     kernel_clone
@@ -2265,17 +2388,71 @@ impl OpenFangKernel {
             .check_quota(agent_id, &entry.manifest.resources)
             .map_err(KernelError::OpenFang)?;
 
-        let mut session = self
-            .memory
-            .get_session(entry.session_id)
-            .map_err(KernelError::OpenFang)?
-            .unwrap_or_else(|| openfang_memory::session::Session {
-                id: entry.session_id,
-                agent_id,
-                messages: Vec::new(),
-                context_window_tokens: 0,
-                label: None,
-            });
+        // Try the in-memory session cache first (populated after the previous
+        // agent loop). Falls back to SQLite via spawn_blocking when the cache
+        // is cold (first call, after session switch, etc.).
+        let mut session = if let Some(cached) = self.registry.take_session_cache(agent_id) {
+            std::sync::Arc::try_unwrap(cached).unwrap_or_else(|arc| (*arc).clone())
+        } else {
+            let memory = Arc::clone(&self.memory);
+            let sid = entry.session_id;
+            tokio::task::spawn_blocking(move || memory.get_session(sid))
+                .await
+                .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(format!("spawn_blocking join: {e}"))))?
+                .map_err(KernelError::OpenFang)?
+                .unwrap_or_else(|| openfang_memory::session::Session {
+                    id: sid,
+                    agent_id,
+                    messages: Vec::new(),
+                    context_window_tokens: 0,
+                    label: None,
+                })
+        };
+
+        // Auto-compact if the session is large before running the loop.
+        // This mirrors the compaction check in send_message_streaming and
+        // prevents background agents from accumulating unbounded sessions
+        // that cause progressively slower LLM calls.
+        {
+            use openfang_runtime::compactor::{
+                estimate_token_count, needs_compaction as check_compact,
+                needs_compaction_by_tokens, CompactionConfig,
+            };
+            let config = CompactionConfig::default();
+            let by_messages = check_compact(&session, &config);
+            let estimated = estimate_token_count(
+                &session.messages,
+                Some(&entry.manifest.model.system_prompt),
+                None,
+            );
+            let by_tokens = needs_compaction_by_tokens(estimated, &config);
+            if by_messages || by_tokens {
+                info!(
+                    agent_id = %agent_id,
+                    messages = session.messages.len(),
+                    estimated_tokens = estimated,
+                    "Auto-compacting session before agent loop"
+                );
+                match self.compact_agent_session(agent_id).await {
+                    Ok(msg) => {
+                        info!(agent_id = %agent_id, "{msg}");
+                        // Reload the session after compaction
+                        let memory = Arc::clone(&self.memory);
+                        let sid = session.id;
+                        if let Ok(Some(reloaded)) =
+                            tokio::task::spawn_blocking(move || memory.get_session(sid))
+                                .await
+                                .unwrap_or(Ok(None))
+                        {
+                            session = reloaded;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(agent_id = %agent_id, "Auto-compaction failed: {e}");
+                    }
+                }
+            }
+        }
 
         // Pre-emptive compaction: compact before LLM call if session is large or quota headroom is low
         {
@@ -2368,13 +2545,28 @@ impl OpenFangKernel {
         // Build the structured system prompt via prompt_builder
         {
             let mcp_tool_count = self.mcp_tools.lock().map(|t| t.len()).unwrap_or(0);
-            let shared_id = shared_memory_agent_id();
-            let user_name = self
-                .memory
-                .structured_get(shared_id, "user_name")
-                .ok()
-                .flatten()
-                .and_then(|v| v.as_str().map(String::from));
+
+            // Run SQLite reads in spawn_blocking to avoid blocking Tokio worker
+            // threads on FUSE I/O (gocryptfs → JuiceFS → S3).
+            let (user_name, canonical_ctx) = {
+                let memory = Arc::clone(&self.memory);
+                let aid = agent_id;
+                tokio::task::spawn_blocking(move || {
+                    let shared_id = shared_memory_agent_id();
+                    let uname = memory
+                        .structured_get(shared_id, "user_name")
+                        .ok()
+                        .flatten()
+                        .and_then(|v| v.as_str().map(String::from));
+                    let cc = memory
+                        .canonical_context(aid, None)
+                        .ok()
+                        .and_then(|(s, _)| s);
+                    (uname, cc)
+                })
+                .await
+                .unwrap_or((None, None))
+            };
 
             let peer_agents: Vec<(String, String, String)> = self
                 .registry
@@ -2418,11 +2610,7 @@ impl OpenFangKernel {
                     .workspace
                     .as_ref()
                     .and_then(|w| read_identity_file(w, "MEMORY.md")),
-                canonical_context: self
-                    .memory
-                    .canonical_context(agent_id, None)
-                    .ok()
-                    .and_then(|(s, _)| s),
+                canonical_context: canonical_ctx,
                 user_name,
                 channel_type: None,
                 is_subagent: manifest
@@ -2464,6 +2652,8 @@ impl OpenFangKernel {
                 ),
                 sender_id,
                 sender_name,
+                ptc_enabled: manifest.ptc_enabled.unwrap_or(self.config.ptc.enabled),
+                memory_backend: self.config.memory.backend.clone(),
             };
             manifest.model.system_prompt =
                 openfang_runtime::prompt_builder::build_system_prompt(&prompt_ctx);
@@ -2503,7 +2693,7 @@ impl OpenFangKernel {
                 max_tokens: manifest.model.max_tokens,
                 temperature: manifest.model.temperature,
                 system: Some(manifest.model.system_prompt.clone()),
-                thinking: None,
+                thinking: manifest.model.thinking.clone(),
             };
             let (complexity, routed_model) = router.select_model(&probe);
             info!(
@@ -2578,24 +2768,44 @@ impl OpenFangKernel {
         .await
         .map_err(KernelError::OpenFang)?;
 
-        // Append new messages to canonical session for cross-channel memory
-        if session.messages.len() > messages_before {
-            let new_messages = session.messages[messages_before..].to_vec();
-            if let Err(e) = self.memory.append_canonical(agent_id, &new_messages, None) {
-                warn!("Failed to update canonical session: {e}");
-            }
-        }
+        // Cache the mutated session in memory so the next call can skip
+        // the FUSE/SQLite round-trip. The background persist below is
+        // purely for durability.
+        self.registry.set_session_cache(
+            agent_id,
+            std::sync::Arc::new(session.clone()),
+        );
 
-        // Write JSONL session mirror to workspace
-        if let Some(ref workspace) = manifest.workspace {
-            if let Err(e) = self
-                .memory
-                .write_jsonl_mirror(&session, &workspace.join("sessions"))
-            {
-                warn!("Failed to write JSONL session mirror: {e}");
-            }
-            // Append daily memory log (best-effort)
-            append_daily_memory_log(workspace, &result.response);
+        // Post-processing I/O: save session, append canonical, write JSONL
+        // mirror, and daily memory log. All hit the FUSE filesystem, so run
+        // in spawn_blocking to avoid blocking Tokio worker threads.
+        {
+            let mem = Arc::clone(&self.memory);
+            let sess = session.clone();
+            let ws = manifest.workspace.clone();
+            let response_text = result.response.clone();
+            let aid = agent_id;
+            let msgs_before = messages_before;
+            let _ = tokio::task::spawn_blocking(move || {
+                // Persist session to SQLite (durability; the in-memory
+                // cache is authoritative for the next call).
+                if let Err(e) = mem.save_session(&sess) {
+                    warn!(agent_id = %aid, "Background session save failed: {e}");
+                }
+                if sess.messages.len() > msgs_before {
+                    let new_messages = sess.messages[msgs_before..].to_vec();
+                    if let Err(e) = mem.append_canonical(aid, &new_messages, None) {
+                        warn!(agent_id = %aid, "Failed to update canonical session: {e}");
+                    }
+                }
+                if let Some(ref workspace) = ws {
+                    if let Err(e) = mem.write_jsonl_mirror(&sess, &workspace.join("sessions")) {
+                        warn!("Failed to write JSONL session mirror: {e}");
+                    }
+                    append_daily_memory_log(workspace, &response_text);
+                }
+            })
+            .await;
         }
 
         // Record usage in the metering engine (uses catalog pricing as single source of truth)
@@ -2883,7 +3093,7 @@ impl OpenFangKernel {
     /// Agents with a custom `base_url` keep their current provider unless
     /// overridden explicitly — this prevents custom setups (e.g. Tencent,
     /// Azure, or other third-party endpoints) from being misidentified.
-    pub fn set_agent_model(
+    pub async fn set_agent_model(
         &self,
         agent_id: AgentId,
         model: &str,
@@ -2959,20 +3169,43 @@ impl OpenFangKernel {
             info!(agent_id = %agent_id, model = %normalized_model, "Agent model updated (provider unchanged)");
         }
 
-        // Persist the updated entry
+        // Persist the updated entry — use async to avoid blocking the tokio
+        // runtime while waiting for the shared SQLite mutex.
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            let _ = self.memory.save_agent_async(&entry).await;
         }
 
         // Clear canonical session to prevent memory poisoning from old model's responses
-        let _ = self.memory.delete_canonical_session(agent_id);
+        let _ = self.memory.delete_canonical_session_async(agent_id).await;
         debug!(agent_id = %agent_id, "Cleared canonical session after model switch");
 
         Ok(())
     }
 
+    /// Set extended thinking configuration for an agent.
+    ///
+    /// Pass `None` to disable thinking, or build a `ThinkingConfig` from a
+    /// named level using [`ThinkingConfig::from_level`].
+    ///
+    /// The change is persisted to storage immediately and takes effect on the
+    /// next LLM call.
+    pub async fn set_agent_thinking(
+        &self,
+        agent_id: AgentId,
+        thinking: Option<openfang_types::config::ThinkingConfig>,
+    ) -> KernelResult<()> {
+        self.registry
+            .update_thinking(agent_id, thinking)
+            .map_err(KernelError::OpenFang)?;
+        if let Some(entry) = self.registry.get(agent_id) {
+            let _ = self.memory.save_agent_async(&entry).await;
+        }
+        info!(agent_id = %agent_id, "Agent thinking config updated");
+        Ok(())
+    }
+
     /// Update an agent's skill allowlist. Empty = all skills (backward compat).
-    pub fn set_agent_skills(&self, agent_id: AgentId, skills: Vec<String>) -> KernelResult<()> {
+    pub async fn set_agent_skills(&self, agent_id: AgentId, skills: Vec<String>) -> KernelResult<()> {
         // Validate skill names if allowlist is non-empty
         if !skills.is_empty() {
             let registry = self
@@ -2994,7 +3227,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            let _ = self.memory.save_agent_async(&entry).await;
         }
 
         info!(agent_id = %agent_id, skills = ?skills, "Agent skills updated");
@@ -3002,7 +3235,7 @@ impl OpenFangKernel {
     }
 
     /// Update an agent's MCP server allowlist. Empty = all servers (backward compat).
-    pub fn set_agent_mcp_servers(
+    pub async fn set_agent_mcp_servers(
         &self,
         agent_id: AgentId,
         servers: Vec<String>,
@@ -3033,7 +3266,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            let _ = self.memory.save_agent_async(&entry).await;
         }
 
         info!(agent_id = %agent_id, servers = ?servers, "Agent MCP servers updated");
@@ -3041,7 +3274,7 @@ impl OpenFangKernel {
     }
 
     /// Update an agent's tool allowlist and/or blocklist.
-    pub fn set_agent_tool_filters(
+    pub async fn set_agent_tool_filters(
         &self,
         agent_id: AgentId,
         allowlist: Option<Vec<String>>,
@@ -3052,7 +3285,7 @@ impl OpenFangKernel {
             .map_err(KernelError::OpenFang)?;
 
         if let Some(entry) = self.registry.get(agent_id) {
-            let _ = self.memory.save_agent(&entry);
+            let _ = self.memory.save_agent_async(&entry).await;
         }
 
         info!(
@@ -3128,7 +3361,8 @@ impl OpenFangKernel {
 
         let session = self
             .memory
-            .get_session(entry.session_id)
+            .get_session_async(entry.session_id)
+            .await
             .map_err(KernelError::OpenFang)?
             .unwrap_or_else(|| openfang_memory::session::Session {
                 id: entry.session_id,
@@ -3155,21 +3389,29 @@ impl OpenFangKernel {
             .await
             .map_err(|e| KernelError::OpenFang(OpenFangError::Internal(e)))?;
 
-        // Store the LLM summary in the canonical session
+        // Store the LLM summary in the canonical session — use async to avoid
+        // blocking the tokio runtime while waiting for the shared SQLite mutex.
         self.memory
-            .store_llm_summary(agent_id, &result.summary, result.kept_messages.clone())
+            .store_llm_summary_async(agent_id, &result.summary, result.kept_messages.clone())
+            .await
             .map_err(KernelError::OpenFang)?;
 
         // Post-compaction audit: validate and repair the kept messages
         let (repaired_messages, repair_stats) =
             openfang_runtime::session_repair::validate_and_repair_with_stats(&result.kept_messages);
 
-        // Also update the regular session with the repaired messages
+        // Also update the regular session with the repaired messages — use
+        // async to avoid blocking the tokio runtime during the heavy write.
         let mut updated_session = session;
         updated_session.messages = repaired_messages;
         self.memory
-            .save_session(&updated_session)
+            .save_session_async(&updated_session)
+            .await
             .map_err(KernelError::OpenFang)?;
+
+        // Invalidate the in-memory session cache — compaction rewrote the
+        // session, so the next call must use the freshly compacted version.
+        self.registry.clear_session_cache(agent_id);
 
         // Build result message with audit summary
         let mut msg = format!(
@@ -3329,6 +3571,7 @@ impl OpenFangKernel {
                 system_prompt: def.agent.system_prompt.clone(),
                 api_key_env: def.agent.api_key_env.clone(),
                 base_url: def.agent.base_url.clone(),
+                thinking: None,
             },
             capabilities: ManifestCapabilities {
                 tools: def.tools.clone(),
@@ -3338,13 +3581,19 @@ impl OpenFangKernel {
                 format!("hand:{hand_id}"),
                 format!("hand_instance:{}", instance.instance_id),
             ],
-            autonomous: def.agent.max_iterations.map(|max_iter| AutonomousConfig {
-                max_iterations: max_iter,
-                // Use the hand-declared heartbeat interval if provided.
-                // The kernel default (30s) is too aggressive for hands making long LLM calls;
-                // HAND.toml authors should set this to reflect expected call latency.
-                heartbeat_interval_secs: def.agent.heartbeat_interval_secs.unwrap_or(30),
-                ..Default::default()
+            autonomous: def.agent.max_iterations.map(|max_iter| {
+                let mut ac = AutonomousConfig {
+                    max_iterations: max_iter,
+                    // Use the hand-declared heartbeat interval if provided.
+                    // The kernel default (30s) is too aggressive for hands making long LLM calls;
+                    // HAND.toml authors should set this to reflect expected call latency.
+                    heartbeat_interval_secs: def.agent.heartbeat_interval_secs.unwrap_or(30),
+                    ..Default::default()
+                };
+                if let Some(dur) = def.agent.max_tick_duration {
+                    ac.max_tick_duration_secs = dur;
+                }
+                ac
             }),
             // Autonomous hands must run in Continuous mode so the background loop picks them up.
             // Reactive (default) only fires on incoming messages, so autonomous hands would be inert.
@@ -3369,7 +3618,15 @@ impl OpenFangKernel {
             } else {
                 None
             },
+            // Do NOT set tool_allowlist here — capabilities.tools (line 3223) already
+            // provides the primary tool filter in available_tools() Step 1.
+            // Setting tool_allowlist to def.tools would cause Step 4 to strip out
+            // MCP tools that were correctly added in Step 3 via mcp_servers opt-in,
+            // because MCP tool names (mcp_github_*, etc.) are dynamic and not in
+            // the hand's static tool list.
+            tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            ptc_enabled: None,
             // Custom profile avoids ToolProfile-based expansion overriding the
             // explicit tool list.
             profile: if !def.tools.is_empty() {
@@ -3897,17 +4154,19 @@ impl OpenFangKernel {
         }
 
         let agents = self.registry.list();
-        let mut bg_agents: Vec<(openfang_types::agent::AgentId, String, ScheduleMode)> = Vec::new();
+        let mut bg_agents: Vec<(openfang_types::agent::AgentId, String, ScheduleMode, Option<u64>)> =
+            Vec::new();
 
         for entry in &agents {
             if matches!(entry.manifest.schedule, ScheduleMode::Reactive) {
                 continue;
             }
-            bg_agents.push((
-                entry.id,
-                entry.name.clone(),
-                entry.manifest.schedule.clone(),
-            ));
+            let tick_duration = entry
+                .manifest
+                .autonomous
+                .as_ref()
+                .map(|a| a.max_tick_duration_secs);
+            bg_agents.push((entry.id, entry.name.clone(), entry.manifest.schedule.clone(), tick_duration));
         }
 
         if !bg_agents.is_empty() {
@@ -3916,8 +4175,8 @@ impl OpenFangKernel {
             // Stagger agent startup to prevent rate-limit storm on shared providers.
             // Each agent gets a 500ms delay before the next one starts.
             tokio::spawn(async move {
-                for (i, (id, name, schedule)) in bg_agents.into_iter().enumerate() {
-                    kernel.start_background_for_agent(id, &name, &schedule);
+                for (i, (id, name, schedule, tick_duration)) in bg_agents.into_iter().enumerate() {
+                    kernel.start_background_for_agent(id, &name, &schedule, tick_duration);
                     if i > 0 {
                         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     }
@@ -4412,6 +4671,7 @@ impl OpenFangKernel {
         agent_id: AgentId,
         name: &str,
         schedule: &ScheduleMode,
+        max_tick_duration_secs: Option<u64>,
     ) {
         // For proactive agents, auto-register triggers from conditions
         if let ScheduleMode::Proactive { conditions } = schedule {
@@ -4430,7 +4690,7 @@ impl OpenFangKernel {
         // Start continuous/periodic loops
         let kernel = Arc::clone(self);
         self.background
-            .start_agent(agent_id, name, schedule, move |aid, msg| {
+            .start_agent(agent_id, name, schedule, max_tick_duration_secs, move |aid, msg| {
                 let k = Arc::clone(&kernel);
                 tokio::spawn(async move {
                     match k.send_message(aid, &msg).await {
@@ -4505,7 +4765,21 @@ impl OpenFangKernel {
     /// the boot-time snapshot). This helper checks both sources so that custom
     /// providers work immediately without a daemon restart.
     /// Resolve a credential by env var name using the vault → dotenv → env var chain.
-    pub fn resolve_credential(&self, key: &str) -> Option<String> {
+    /// Resolve a pending client tool call with the result from the connected client.
+    /// Called by the WS handler when it receives a `client_tool_result` message.
+    ///
+    /// Returns `true` if the call_id was found and resolved, `false` if no pending
+    /// call matched (stale result or duplicate).
+    pub fn resolve_client_tool(&self, call_id: &str, content: String, is_error: bool) -> bool {
+        if let Some((_, tx)) = self.client_tool_pending.remove(call_id) {
+            let _ = tx.send((content, is_error));
+            true
+        } else {
+            false
+        }
+    }
+
+     pub fn resolve_credential(&self, key: &str) -> Option<String> {
         self.credential_resolver
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -4703,6 +4977,7 @@ impl OpenFangKernel {
     /// Connect to all configured MCP servers and cache their tool definitions.
     async fn connect_mcp_servers(self: &Arc<Self>) {
         use openfang_runtime::mcp::{McpConnection, McpServerConfig, McpTransport};
+        use openfang_runtime::mcp_auth::McpAuthProvider;
         use openfang_types::config::McpTransportEntry;
 
         let servers = self
@@ -4710,6 +4985,23 @@ impl OpenFangKernel {
             .read()
             .map(|s| s.clone())
             .unwrap_or_default();
+
+        // Obtain a Vault token for MCP auth (if enabled).
+        let mcp_auth_token = if self.config.mcp_auth.enabled {
+            let provider = McpAuthProvider::new(self.config.mcp_auth.clone());
+            match provider.get_token().await {
+                Some(token) => {
+                    info!("MCP auth: Vault token obtained for MCP proxy authentication");
+                    Some(token)
+                }
+                None => {
+                    error!("MCP auth enabled but failed to obtain Vault token — MCP connections will fail");
+                    None
+                }
+            }
+        } else {
+            None
+        };
 
         for server_config in &servers {
             let transport = match &server_config.transport {
@@ -4732,12 +5024,24 @@ impl OpenFangKernel {
                 }
             }
 
+            // Inject the Vault token as Authorization header for HTTP/SSE
+            // MCP servers (credential-injecting proxies).
+            let mut headers = server_config.headers.clone();
+            if let Some(ref token) = mcp_auth_token {
+                if matches!(
+                    server_config.transport,
+                    McpTransportEntry::Http { .. } | McpTransportEntry::Sse { .. }
+                ) {
+                    headers.push(format!("Authorization: Bearer {token}"));
+                }
+            }
+
             let mcp_config = McpServerConfig {
                 name: server_config.name.clone(),
                 transport,
                 timeout_secs: server_config.timeout_secs,
                 env: server_config.env.clone(),
-                headers: server_config.headers.clone(),
+                headers,
             };
 
             match McpConnection::connect(mcp_config).await {
@@ -5053,7 +5357,7 @@ impl OpenFangKernel {
         agent_id: AgentId,
         skill_snapshot: Option<&openfang_skills::registry::SkillRegistry>,
     ) -> Vec<ToolDefinition> {
-        let all_builtins = if self.config.browser.enabled {
+        let mut all_builtins = if self.config.browser.enabled {
             builtin_tool_definitions()
         } else {
             // When built-in browser is disabled (replaced by an external
@@ -5063,6 +5367,11 @@ impl OpenFangKernel {
                 .filter(|t| !t.name.starts_with("browser_"))
                 .collect()
         };
+
+        // Add hindsight-specific tools (memory_retain, memory_reflect) when backend is hindsight
+        if self.config.memory.backend == "hindsight" {
+            all_builtins.extend(openfang_runtime::tool_runner::hindsight_tool_definitions());
+        }
 
         // Look up agent entry for profile, skill/MCP allowlists, and declared tools
         let entry = self.registry.get(agent_id);
@@ -5173,9 +5482,19 @@ impl OpenFangKernel {
                     .cloned()
                     .collect()
             };
+            // When an agent explicitly lists MCP servers via `mcp_servers`,
+            // include all tools from those servers without requiring each
+            // tool name in the declared tools list.  MCP tool names are
+            // dynamic and change when the upstream server updates, so
+            // `mcp_servers` acts as the opt-in for the entire server's
+            // tool set.  If the agent does NOT list mcp_servers (empty
+            // allowlist → all MCP tools are candidates), fall back to the
+            // declared-tools filter to avoid flooding the context.
+            let mcp_explicitly_opted_in = !mcp_allowlist.is_empty();
             for t in mcp_candidates {
-                // If agent declares specific tools, only include matching MCP tools
-                if !tools_unrestricted && !declared_tools.iter().any(|d| d == &t.name) {
+                if !tools_unrestricted && !mcp_explicitly_opted_in
+                    && !declared_tools.iter().any(|d| d == &t.name)
+                {
                     continue;
                 }
                 all_tools.push(t);
@@ -5553,6 +5872,21 @@ impl OpenFangKernel {
             }
         }
     }
+
+    /// Resolve an agent identifier (UUID string or human-readable name) to
+    /// `(AgentId, name)`. Returns `None` if the agent is not registered.
+    fn resolve_agent_id_and_name(&self, agent_id: &str) -> Option<(AgentId, String)> {
+        // Try UUID first
+        if let Ok(id) = agent_id.parse::<AgentId>() {
+            if let Some(entry) = self.registry.get(id) {
+                return Some((id, entry.name.clone()));
+            }
+        }
+        // Fall back to name lookup
+        self.registry
+            .find_by_name(agent_id)
+            .map(|entry| (entry.id, entry.name.clone()))
+    }
 }
 
 /// Convert a manifest's capability declarations into Capability enums.
@@ -5917,6 +6251,12 @@ impl KernelHandle for OpenFangKernel {
         OpenFangKernel::kill_agent(self, id).map_err(|e| format!("Kill failed: {e}"))
     }
 
+    fn touch_active(&self, agent_id: &str) {
+        if let Ok(id) = agent_id.parse::<AgentId>() {
+            let _ = self.registry.set_state(id, AgentState::Running);
+        }
+    }
+
     fn memory_store(&self, key: &str, value: serde_json::Value) -> Result<(), String> {
         let agent_id = shared_memory_agent_id();
         self.memory
@@ -5974,9 +6314,13 @@ impl KernelHandle for OpenFangKernel {
             .map_err(|e| format!("Task post failed: {e}"))
     }
 
-    async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String> {
+    async fn task_claim(
+        &self,
+        agent_id: &str,
+        agent_name: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, String> {
         self.memory
-            .task_claim(agent_id)
+            .task_claim(agent_id, agent_name)
             .await
             .map_err(|e| format!("Task claim failed: {e}"))
     }
@@ -6041,6 +6385,41 @@ impl KernelHandle for OpenFangKernel {
             .query_graph(pattern)
             .await
             .map_err(|e| format!("Knowledge query failed: {e}"))
+    }
+
+    #[cfg(feature = "hindsight")]
+    async fn memory_retain(
+        &self,
+        agent_id: &str,
+        content: &str,
+        context: &str,
+        tags: Option<Vec<String>>,
+        metadata: Option<std::collections::HashMap<String, String>>,
+        timestamp: Option<&str>,
+    ) -> Result<String, String> {
+        let aid = openfang_types::agent::AgentId(
+            uuid::Uuid::parse_str(agent_id).map_err(|e| format!("Invalid agent ID: {e}"))?,
+        );
+        self.memory
+            .retain_explicit(aid, content, context, tags, metadata, timestamp)
+            .await
+            .map_err(|e| format!("memory_retain failed: {e}"))
+    }
+
+    #[cfg(feature = "hindsight")]
+    async fn memory_reflect(
+        &self,
+        agent_id: &str,
+        query: &str,
+        budget: Option<&str>,
+    ) -> Result<String, String> {
+        let aid = openfang_types::agent::AgentId(
+            uuid::Uuid::parse_str(agent_id).map_err(|e| format!("Invalid agent ID: {e}"))?,
+        );
+        self.memory
+            .reflect(aid, query, budget)
+            .await
+            .map_err(|e| format!("memory_reflect failed: {e}"))
     }
 
     /// Spawn with capability inheritance enforcement.
@@ -6374,6 +6753,25 @@ impl KernelHandle for OpenFangKernel {
                 .map_err(|e| format!("Channel send failed: {e}"))?;
         }
 
+        // Check for delivery receipt (provided by adapters that track delivery).
+        if let Some(receipt) = adapter.take_delivery_receipt() {
+            let status_str = match &receipt.status {
+                openfang_channels::types::DeliveryStatus::Delivered => "delivered",
+                openfang_channels::types::DeliveryStatus::Sent => "sent",
+                openfang_channels::types::DeliveryStatus::Failed => "failed",
+                openfang_channels::types::DeliveryStatus::BestEffort => "sent (best-effort)",
+            };
+            let msg_id_part = if receipt.message_id.is_empty() {
+                String::new()
+            } else {
+                format!(", message_id={}", receipt.message_id)
+            };
+            let result = format!(
+                "Message {status_str} to {recipient} via {channel}{msg_id_part}"
+            );
+            return Ok(result);
+        }
+
         Ok(format!("Message sent to {} via {}", recipient, channel))
     }
 
@@ -6437,6 +6835,17 @@ impl KernelHandle for OpenFangKernel {
                 .map_err(|e| format!("Channel media send failed: {e}"))?;
         }
 
+        if let Some(receipt) = adapter.take_delivery_receipt() {
+            let status_str = match &receipt.status {
+                openfang_channels::types::DeliveryStatus::Delivered => "delivered",
+                openfang_channels::types::DeliveryStatus::Sent => "sent",
+                _ => "sent",
+            };
+            return Ok(format!(
+                "{media_type} {status_str} to {recipient} via {channel}"
+            ));
+        }
+
         Ok(format!(
             "{} sent to {} via {}",
             media_type, recipient, channel
@@ -6492,6 +6901,17 @@ impl KernelHandle for OpenFangKernel {
                 .map_err(|e| format!("Channel file send failed: {e}"))?;
         }
 
+        if let Some(receipt) = adapter.take_delivery_receipt() {
+            let status_str = match &receipt.status {
+                openfang_channels::types::DeliveryStatus::Delivered => "delivered",
+                openfang_channels::types::DeliveryStatus::Sent => "sent",
+                _ => "sent",
+            };
+            return Ok(format!(
+                "File '{filename}' {status_str} to {recipient} via {channel}"
+            ));
+        }
+
         Ok(format!(
             "File '{}' sent to {} via {}",
             filename, recipient, channel
@@ -6521,6 +6941,306 @@ impl KernelHandle for OpenFangKernel {
 
         // Delegate to the normal spawn path (use trait method via KernelHandle::)
         KernelHandle::spawn_agent(self, manifest_toml, parent_id).await
+    }
+
+    // -----------------------------------------------------------------
+    // Cross-agent context search (Issue #13)
+    // -----------------------------------------------------------------
+
+    async fn get_agent_context(
+        &self,
+        agent_id: &str,
+        max_messages: usize,
+        time_window_minutes: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        // Resolve agent by UUID or name
+        let (aid, agent_name) = self
+            .resolve_agent_id_and_name(agent_id)
+            .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+
+        // Cap to prevent unbounded reads
+        let limit = max_messages.min(100);
+
+        let (summary, messages) = self
+            .memory
+            .canonical_context(aid, Some(limit))
+            .map_err(|e| format!("Failed to load context: {e}"))?;
+
+        // Build the time cutoff if a window is specified
+        let cutoff = time_window_minutes.map(|mins| {
+            chrono::Utc::now() - chrono::Duration::minutes(mins.min(1440) as i64)
+        });
+
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        // Include the compacted summary if present
+        if let Some(ref s) = summary {
+            results.push(serde_json::json!({
+                "agent_id": aid.to_string(),
+                "agent_name": &agent_name,
+                "source": "summary",
+                "role": "system",
+                "content": openfang_types::truncate_str(s, 2000),
+            }));
+        }
+
+        // Add recent messages (reverse order — newest first for time-window filtering,
+        // then re-reverse to return chronological order)
+        for msg in &messages {
+            let role = match msg.role {
+                openfang_types::message::Role::User => "user",
+                openfang_types::message::Role::Assistant => "assistant",
+                openfang_types::message::Role::System => "system",
+            };
+            let text = msg.content.text_content();
+            if text.is_empty() {
+                continue;
+            }
+            results.push(serde_json::json!({
+                "agent_id": aid.to_string(),
+                "agent_name": &agent_name,
+                "source": "context",
+                "role": role,
+                "content": openfang_types::truncate_str(&text, 500),
+            }));
+        }
+
+        // If there's a time cutoff, we can't filter individual messages by timestamp
+        // (Message struct has no timestamp), but we can limit to the most recent N.
+        // The canonical_context already returns the most recent `limit` messages.
+        // For time-window, we use the semantic memory as a time-aware supplement.
+        if let Some(cutoff_dt) = cutoff {
+            // Supplement with semantic memories that have timestamps
+            let filter = openfang_types::memory::MemoryFilter {
+                agent_id: Some(aid),
+                after: Some(cutoff_dt),
+                ..Default::default()
+            };
+            if let Ok(memories) = self.memory.recall("", 10, Some(filter)).await {
+                for mem in memories {
+                    results.push(serde_json::json!({
+                        "agent_id": aid.to_string(),
+                        "agent_name": &agent_name,
+                        "source": "memory",
+                        "role": "memory",
+                        "content": openfang_types::truncate_str(&mem.content, 500),
+                        "timestamp": mem.created_at.to_rfc3339(),
+                    }));
+                }
+            }
+        }
+
+        // Cap total response size
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    async fn search_agent_context(
+        &self,
+        agent_id: &str,
+        query: &str,
+        max_results: usize,
+        time_window_minutes: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        // Security: cap limits
+        let limit = max_results.min(50);
+        let query_lower = query.to_lowercase();
+
+        let cutoff = time_window_minutes.map(|mins| {
+            chrono::Utc::now() - chrono::Duration::minutes(mins.min(1440) as i64)
+        });
+
+        // Determine which agents to search
+        let agents_to_search: Vec<(AgentId, String)> = if agent_id == "all" {
+            self.registry
+                .list()
+                .into_iter()
+                .map(|e| (e.id, e.name.clone()))
+                .collect()
+        } else {
+            let (aid, name) = self
+                .resolve_agent_id_and_name(agent_id)
+                .ok_or_else(|| format!("Agent not found: {agent_id}"))?;
+            vec![(aid, name)]
+        };
+
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        // Phase 1: Search canonical session messages (keyword match)
+        for (aid, agent_name) in &agents_to_search {
+            // Load recent context (up to 100 messages per agent to keep it bounded)
+            let window_size = if agent_id == "all" { 50 } else { 100 };
+            let (summary, messages) = self
+                .memory
+                .canonical_context(*aid, Some(window_size))
+                .map_err(|e| format!("Failed to load context for {agent_name}: {e}"))?;
+
+            // Search the compacted summary
+            if let Some(ref s) = summary {
+                if s.to_lowercase().contains(&query_lower) {
+                    results.push(serde_json::json!({
+                        "agent_id": aid.to_string(),
+                        "agent_name": agent_name,
+                        "source": "summary",
+                        "role": "system",
+                        "content": openfang_types::truncate_str(s, 500),
+                        "relevance": "keyword_match",
+                    }));
+                }
+            }
+
+            // Search individual messages
+            for msg in &messages {
+                let text = msg.content.text_content();
+                if text.is_empty() {
+                    continue;
+                }
+                if text.to_lowercase().contains(&query_lower) {
+                    let role = match msg.role {
+                        openfang_types::message::Role::User => "user",
+                        openfang_types::message::Role::Assistant => "assistant",
+                        openfang_types::message::Role::System => "system",
+                    };
+                    results.push(serde_json::json!({
+                        "agent_id": aid.to_string(),
+                        "agent_name": agent_name,
+                        "source": "context",
+                        "role": role,
+                        "content": openfang_types::truncate_str(&text, 500),
+                        "relevance": "keyword_match",
+                    }));
+                    if results.len() >= limit {
+                        break;
+                    }
+                }
+            }
+
+            if results.len() >= limit {
+                break;
+            }
+        }
+
+        // Phase 1: Also search semantic memories (these have timestamps)
+        if results.len() < limit {
+            for (aid, agent_name) in &agents_to_search {
+                let remaining = limit.saturating_sub(results.len());
+                if remaining == 0 {
+                    break;
+                }
+                let filter = openfang_types::memory::MemoryFilter {
+                    agent_id: Some(*aid),
+                    after: cutoff,
+                    ..Default::default()
+                };
+                if let Ok(memories) = self.memory.recall(query, remaining, Some(filter)).await {
+                    for mem in memories {
+                        results.push(serde_json::json!({
+                            "agent_id": aid.to_string(),
+                            "agent_name": agent_name,
+                            "source": "memory",
+                            "role": "memory",
+                            "content": openfang_types::truncate_str(&mem.content, 500),
+                            "timestamp": mem.created_at.to_rfc3339(),
+                            "relevance": "semantic_recall",
+                        }));
+                    }
+                }
+            }
+        }
+
+        results.truncate(limit);
+        Ok(results)
+    }
+
+    async fn execute_client_tool(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        tool_use_id: &str,
+        input: &serde_json::Value,
+    ) -> Result<String, String> {
+        use tokio::sync::oneshot;
+
+        let call_id = format!("ct_{}", &uuid::Uuid::new_v4().to_string().replace('-', "")[..12]);
+
+        let (tx, rx) = oneshot::channel::<(String, bool)>();
+        self.client_tool_pending.insert(call_id.clone(), tx);
+
+        // Broadcast the tool call to the WS handler. The WS handler
+        // subscribes to client_tool_tx and forwards calls to the client.
+        // The `agent_id` field allows WS connections to filter — each
+        // connection only forwards calls from its own agent, preventing
+        // duplicate execution when multiple agents are connected.
+        let _ = self.client_tool_tx.send(serde_json::json!({
+            "type": "client_tool_call",
+            "call_id": call_id,
+            "agent_id": agent_id,
+            "tool": tool_name,
+            "tool_use_id": tool_use_id,
+            "input": input,
+        }));
+
+        // Wait for the result with a timeout
+        match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
+            Ok(Ok((content, is_error))) => {
+                if is_error {
+                    Err(content)
+                } else {
+                    Ok(content)
+                }
+            }
+            Ok(Err(_)) => {
+                self.client_tool_pending.remove(&call_id);
+                Err("Client tool call was cancelled".to_string())
+            }
+            Err(_) => {
+                self.client_tool_pending.remove(&call_id);
+                Err("Client tool call timed out (30s) — is the client connected?".to_string())
+            }
+        }
+    }
+
+    fn list_active_agents_with_context(&self) -> Vec<serde_json::Value> {
+        let agents = self.registry.list();
+        let mut results: Vec<serde_json::Value> = Vec::new();
+
+        for entry in &agents {
+            // Get a brief context summary: message count from canonical session
+            let (msg_count, last_preview) = self
+                .memory
+                .canonical_context(entry.id, Some(1))
+                .map(|(_, msgs)| {
+                    let preview = msgs
+                        .first()
+                        .map(|m| {
+                            openfang_types::truncate_str(&m.content.text_content(), 200)
+                                .to_string()
+                        })
+                        .unwrap_or_default();
+                    // For total count, load full context (capped) to get the count
+                    let total = self
+                        .memory
+                        .canonical_context(entry.id, Some(500))
+                        .map(|(_, all)| all.len())
+                        .unwrap_or(0);
+                    (total, preview)
+                })
+                .unwrap_or((0, String::new()));
+
+            results.push(serde_json::json!({
+                "id": entry.id.to_string(),
+                "name": &entry.name,
+                "state": format!("{:?}", entry.state),
+                "description": openfang_types::truncate_str(&entry.manifest.description, 200),
+                "last_active": entry.last_active.to_rfc3339(),
+                "message_count": msg_count,
+                "last_message_preview": last_preview,
+                "model": format!("{}:{}", entry.manifest.model.provider, entry.manifest.model.model),
+                "tags": &entry.tags,
+            }));
+        }
+
+        results
     }
 }
 
@@ -6631,6 +7351,7 @@ mod tests {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            ptc_enabled: None,
         };
         manifest.capabilities.tools = vec!["file_read".to_string(), "web_fetch".to_string()];
         manifest.capabilities.agent_spawn = true;
@@ -6668,6 +7389,7 @@ mod tests {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            ptc_enabled: None,
         }
     }
 
@@ -6692,6 +7414,7 @@ mod tests {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: None,
         };
         registry.register(entry).unwrap();
 
@@ -6729,6 +7452,7 @@ mod tests {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: None,
         };
         registry.register(e1).unwrap();
 
@@ -6752,6 +7476,7 @@ mod tests {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: None,
         };
         registry.register(e2).unwrap();
 

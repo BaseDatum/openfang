@@ -25,8 +25,17 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use tracing::{info, warn};
 
+#[cfg(feature = "hindsight")]
+use crate::hindsight::HindsightBackend;
+
 /// The unified memory substrate. Implements the `Memory` trait by delegating
 /// to specialized stores backed by a shared SQLite connection.
+///
+/// When the `hindsight` feature is enabled and configured, semantic operations
+/// (remember, recall, forget) and knowledge-graph operations (add_entity,
+/// add_relation, query_graph, consolidate) are routed to a Hindsight server
+/// instead of the local SQLite stores. Structured operations (KV, sessions,
+/// tasks, devices) always use the local SQLite database.
 pub struct MemorySubstrate {
     conn: Arc<Mutex<Connection>>,
     structured: StructuredStore,
@@ -35,6 +44,10 @@ pub struct MemorySubstrate {
     sessions: SessionStore,
     consolidation: ConsolidationEngine,
     usage: UsageStore,
+
+    /// When set, semantic and graph operations are routed to Hindsight.
+    #[cfg(feature = "hindsight")]
+    hindsight: Option<HindsightBackend>,
 }
 
 impl MemorySubstrate {
@@ -64,6 +77,8 @@ impl MemorySubstrate {
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
+            #[cfg(feature = "hindsight")]
+            hindsight: None,
         })
     }
 
@@ -118,7 +133,20 @@ impl MemorySubstrate {
             sessions: SessionStore::new(Arc::clone(&shared)),
             usage: UsageStore::new(Arc::clone(&shared)),
             consolidation: ConsolidationEngine::new(shared, decay_rate),
+            #[cfg(feature = "hindsight")]
+            hindsight: None,
         })
+    }
+
+    /// Enable the Hindsight backend for semantic and graph operations.
+    ///
+    /// When set, `remember`, `recall`, `forget`, `add_entity`, `add_relation`,
+    /// `query_graph`, and `consolidate` are routed to the Hindsight server.
+    /// All other operations (KV, sessions, tasks) remain on SQLite.
+    #[cfg(feature = "hindsight")]
+    pub fn with_hindsight(mut self, backend: HindsightBackend) -> Self {
+        self.hindsight = Some(backend);
+        self
     }
 
     /// Get a reference to the usage store.
@@ -134,6 +162,16 @@ impl MemorySubstrate {
     /// Save an agent entry to persistent storage.
     pub fn save_agent(&self, entry: &AgentEntry) -> OpenFangResult<()> {
         self.structured.save_agent(entry)
+    }
+
+    /// Save an agent entry asynchronously — runs the SQLite write in a blocking
+    /// thread so the tokio runtime stays responsive.
+    pub async fn save_agent_async(&self, entry: &AgentEntry) -> OpenFangResult<()> {
+        let structured = self.structured.clone();
+        let entry = entry.clone();
+        tokio::task::spawn_blocking(move || structured.save_agent(&entry))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
     /// Load an agent entry from persistent storage.
@@ -192,6 +230,15 @@ impl MemorySubstrate {
         self.sessions.get_session(session_id)
     }
 
+    /// Get a session by ID asynchronously — runs the SQLite read in a blocking
+    /// thread so the tokio runtime stays responsive.
+    pub async fn get_session_async(&self, session_id: SessionId) -> OpenFangResult<Option<Session>> {
+        let sessions = self.sessions.clone();
+        tokio::task::spawn_blocking(move || sessions.get_session(session_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
+    }
+
     /// Save a session.
     pub fn save_session(&self, session: &Session) -> OpenFangResult<()> {
         self.sessions.save_session(session)
@@ -230,6 +277,15 @@ impl MemorySubstrate {
     /// Delete the canonical (cross-channel) session for an agent.
     pub fn delete_canonical_session(&self, agent_id: AgentId) -> OpenFangResult<()> {
         self.sessions.delete_canonical_session(agent_id)
+    }
+
+    /// Delete the canonical session asynchronously — runs the SQLite write in a
+    /// blocking thread so the tokio runtime stays responsive.
+    pub async fn delete_canonical_session_async(&self, agent_id: AgentId) -> OpenFangResult<()> {
+        let sessions = self.sessions.clone();
+        tokio::task::spawn_blocking(move || sessions.delete_canonical_session(agent_id))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
     /// Set or clear a session label.
@@ -288,6 +344,21 @@ impl MemorySubstrate {
     ) -> OpenFangResult<()> {
         self.sessions
             .store_llm_summary(agent_id, summary, kept_messages)
+    }
+
+    /// Store an LLM-generated summary asynchronously — runs the SQLite write in
+    /// a blocking thread so the tokio runtime stays responsive.
+    pub async fn store_llm_summary_async(
+        &self,
+        agent_id: AgentId,
+        summary: &str,
+        kept_messages: Vec<openfang_types::message::Message>,
+    ) -> OpenFangResult<()> {
+        let sessions = self.sessions.clone();
+        let summary = summary.to_string();
+        tokio::task::spawn_blocking(move || sessions.store_llm_summary(agent_id, &summary, kept_messages))
+            .await
+            .map_err(|e| OpenFangError::Internal(e.to_string()))?
     }
 
     /// Write a human-readable JSONL mirror of a session to disk.
@@ -463,6 +534,48 @@ impl MemorySubstrate {
     }
 
     // -----------------------------------------------------------------
+    // Hindsight-specific operations (memory_retain, memory_reflect)
+    // -----------------------------------------------------------------
+
+    /// Explicitly retain a fact (Hindsight only). Used by the `memory_retain` tool.
+    #[cfg(feature = "hindsight")]
+    pub async fn retain_explicit(
+        &self,
+        agent_id: AgentId,
+        content: &str,
+        context: &str,
+        tags: Option<Vec<String>>,
+        metadata: Option<std::collections::HashMap<String, String>>,
+        timestamp: Option<&str>,
+    ) -> OpenFangResult<String> {
+        if let Some(ref hs) = self.hindsight {
+            return hs
+                .retain_explicit(agent_id, content, context, tags, metadata, timestamp)
+                .await;
+        }
+        Err(OpenFangError::Memory(
+            "retain_explicit requires hindsight backend".to_string(),
+        ))
+    }
+
+    /// Reflect — synthesized reasoning across memories (Hindsight only).
+    /// Used by the `memory_reflect` tool.
+    #[cfg(feature = "hindsight")]
+    pub async fn reflect(
+        &self,
+        agent_id: AgentId,
+        query: &str,
+        budget: Option<&str>,
+    ) -> OpenFangResult<String> {
+        if let Some(ref hs) = self.hindsight {
+            return hs.reflect(agent_id, query, budget).await;
+        }
+        Err(OpenFangError::Memory(
+            "reflect requires hindsight backend".to_string(),
+        ))
+    }
+
+    // -----------------------------------------------------------------
     // Task queue operations
     // -----------------------------------------------------------------
 
@@ -497,22 +610,34 @@ impl MemorySubstrate {
     }
 
     /// Claim the next pending task (optionally for a specific assignee). Returns task JSON or None.
-    pub async fn task_claim(&self, agent_id: &str) -> OpenFangResult<Option<serde_json::Value>> {
+    ///
+    /// Matches tasks where `assigned_to` equals the agent's UUID (`agent_id`),
+    /// the agent's human-readable name (`agent_name`), or is empty (unassigned).
+    /// This allows tasks posted by name (e.g. "get-it-done-hand") to be claimed
+    /// by the agent whose runtime identity is a UUID.
+    pub async fn task_claim(
+        &self,
+        agent_id: &str,
+        agent_name: Option<&str>,
+    ) -> OpenFangResult<Option<serde_json::Value>> {
         let conn = Arc::clone(&self.conn);
         let agent_id = agent_id.to_string();
+        let agent_name = agent_name.unwrap_or("").to_string();
 
         tokio::task::spawn_blocking(move || {
             let db = conn.lock().map_err(|e| OpenFangError::Internal(e.to_string()))?;
-            // Find first pending task assigned to this agent, or any unassigned pending task
+            // Find first pending task assigned to this agent (by UUID or name),
+            // or any unassigned pending task.
             let mut stmt = db.prepare(
                 "SELECT id, title, description, assigned_to, created_by, created_at
                  FROM task_queue
-                 WHERE status = 'pending' AND (assigned_to = ?1 OR assigned_to = '')
+                 WHERE status = 'pending'
+                   AND (assigned_to = ?1 OR (?2 != '' AND assigned_to = ?2) OR assigned_to = '')
                  ORDER BY priority DESC, created_at ASC
                  LIMIT 1"
             ).map_err(|e| OpenFangError::Memory(e.to_string()))?;
 
-            let result = stmt.query_row(rusqlite::params![agent_id], |row| {
+            let result = stmt.query_row(rusqlite::params![agent_id, agent_name], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -655,6 +780,11 @@ impl Memory for MemorySubstrate {
         scope: &str,
         metadata: HashMap<String, serde_json::Value>,
     ) -> OpenFangResult<MemoryId> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.remember(agent_id, content, source, scope, metadata).await;
+        }
+
         let store = self.semantic.clone();
         let content = content.to_string();
         let scope = scope.to_string();
@@ -671,6 +801,11 @@ impl Memory for MemorySubstrate {
         limit: usize,
         filter: Option<MemoryFilter>,
     ) -> OpenFangResult<Vec<MemoryFragment>> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.recall(query, limit, filter).await;
+        }
+
         let store = self.semantic.clone();
         let query = query.to_string();
         tokio::task::spawn_blocking(move || store.recall(&query, limit, filter))
@@ -679,6 +814,11 @@ impl Memory for MemorySubstrate {
     }
 
     async fn forget(&self, id: MemoryId) -> OpenFangResult<()> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.forget(id).await;
+        }
+
         let store = self.semantic.clone();
         tokio::task::spawn_blocking(move || store.forget(id))
             .await
@@ -686,6 +826,11 @@ impl Memory for MemorySubstrate {
     }
 
     async fn add_entity(&self, entity: Entity) -> OpenFangResult<String> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.add_entity(entity).await;
+        }
+
         let store = self.knowledge.clone();
         tokio::task::spawn_blocking(move || store.add_entity(entity))
             .await
@@ -693,6 +838,11 @@ impl Memory for MemorySubstrate {
     }
 
     async fn add_relation(&self, relation: Relation) -> OpenFangResult<String> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.add_relation(relation).await;
+        }
+
         let store = self.knowledge.clone();
         tokio::task::spawn_blocking(move || store.add_relation(relation))
             .await
@@ -700,6 +850,11 @@ impl Memory for MemorySubstrate {
     }
 
     async fn query_graph(&self, pattern: GraphPattern) -> OpenFangResult<Vec<GraphMatch>> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.query_graph(pattern).await;
+        }
+
         let store = self.knowledge.clone();
         tokio::task::spawn_blocking(move || store.query_graph(pattern))
             .await
@@ -707,6 +862,11 @@ impl Memory for MemorySubstrate {
     }
 
     async fn consolidate(&self) -> OpenFangResult<ConsolidationReport> {
+        #[cfg(feature = "hindsight")]
+        if let Some(ref hs) = self.hindsight {
+            return hs.consolidate().await;
+        }
+
         let engine = self.consolidation.clone();
         tokio::task::spawn_blocking(move || engine.consolidate())
             .await
@@ -797,7 +957,7 @@ mod tests {
             .unwrap();
 
         // Claim the task
-        let claimed = substrate.task_claim("auditor").await.unwrap();
+        let claimed = substrate.task_claim("auditor", None).await.unwrap();
         assert!(claimed.is_some());
         let claimed = claimed.unwrap();
         assert_eq!(claimed["id"], task_id);
@@ -818,7 +978,42 @@ mod tests {
     #[tokio::test]
     async fn test_task_claim_empty() {
         let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
-        let claimed = substrate.task_claim("nobody").await.unwrap();
+        let claimed = substrate.task_claim("nobody", None).await.unwrap();
         assert!(claimed.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_task_claim_by_agent_name() {
+        // Reproduces the hand scenario: task posted with agent name, claimed with UUID
+        let substrate = MemorySubstrate::open_in_memory(0.1).unwrap();
+        let task_id = substrate
+            .task_post(
+                "Draft follow-up email",
+                "Draft a follow-up email to Sarah about the partnership",
+                Some("get-it-done-hand"), // EA posts using agent name
+                Some("executive-assistant-hand"),
+            )
+            .await
+            .unwrap();
+
+        // Claiming by UUID alone should NOT match (this was the bug)
+        let claimed = substrate
+            .task_claim("f47ac10b-58cc-4372-a567-0e02b2c3d479", None)
+            .await
+            .unwrap();
+        assert!(claimed.is_none(), "UUID-only claim should not match a name-assigned task");
+
+        // Claiming with the correct agent_name should match
+        let claimed = substrate
+            .task_claim(
+                "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+                Some("get-it-done-hand"),
+            )
+            .await
+            .unwrap();
+        assert!(claimed.is_some(), "Claim with agent_name should match name-assigned task");
+        let claimed = claimed.unwrap();
+        assert_eq!(claimed["id"], task_id);
+        assert_eq!(claimed["status"], "in_progress");
     }
 }

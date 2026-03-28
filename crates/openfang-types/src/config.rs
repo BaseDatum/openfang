@@ -964,6 +964,110 @@ impl Default for ThinkingConfig {
     }
 }
 
+impl ThinkingConfig {
+    /// Build a `ThinkingConfig` from a named level string.
+    ///
+    /// | Level    | `budget_tokens` |
+    /// |----------|----------------|
+    /// | `"low"`    | 1 500          |
+    /// | `"medium"` | 10 000         |
+    /// | `"high"`   | 32 000         |
+    ///
+    /// Returns `None` for `"off"` / `"none"` / unknown values.
+    pub fn from_level(level: &str) -> Option<Self> {
+        match level {
+            "low" => Some(Self {
+                budget_tokens: 1_500,
+                stream_thinking: false,
+            }),
+            "medium" => Some(Self {
+                budget_tokens: 10_000,
+                stream_thinking: false,
+            }),
+            "high" => Some(Self {
+                budget_tokens: 32_000,
+                stream_thinking: false,
+            }),
+            _ => None, // "off", "none", or unrecognised → disabled
+        }
+    }
+
+    /// Return the named level string that best describes this config.
+    pub fn level_name(&self) -> &'static str {
+        if self.budget_tokens <= 2_000 {
+            "low"
+        } else if self.budget_tokens <= 15_000 {
+            "medium"
+        } else {
+            "high"
+        }
+    }
+}
+
+/// Programmatic Tool Calling (PTC) configuration.
+///
+/// When enabled, agents receive a single `execute_code` tool instead of
+/// individual tool JSON schemas. The LLM writes Python code that calls
+/// tools as functions, and only `print()` output enters the context window.
+/// This reduces context usage by 30-40%+ and eliminates multi-turn tool roundtrips.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PtcConfig {
+    /// Whether PTC is enabled globally (default: true).
+    /// Per-agent override via `ptc_enabled` in agent manifests.
+    pub enabled: bool,
+    /// Timeout for Python subprocess execution in seconds (default: 120).
+    pub timeout_secs: u64,
+    /// Maximum stdout size in bytes before truncation (default: 100000).
+    pub max_stdout_bytes: usize,
+}
+
+impl Default for PtcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            timeout_secs: 120,
+            max_stdout_bytes: 100_000,
+        }
+    }
+}
+
+/// MCP authentication via OpenBao K8s auth.
+///
+/// When enabled, agent pods authenticate to OpenBao using their per-user
+/// K8s ServiceAccount token (projected volume) and receive a Vault token.
+/// This token is sent as `Authorization: Bearer` on every MCP request,
+/// providing cryptographic proof of user identity to MCP proxies.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct McpAuthConfig {
+    /// Enable MCP auth.  When false, no Authorization header is injected.
+    pub enabled: bool,
+    /// OpenBao server address.
+    pub bao_addr: String,
+    /// Path to the CA cert for verifying OpenBao TLS.
+    pub bao_ca_cert: String,
+    /// Kubernetes auth mount path in OpenBao.
+    pub bao_auth_mount: String,
+    /// Role name for agent pods.
+    pub bao_auth_role: String,
+    /// Path to the projected SA token file.
+    pub sa_token_path: String,
+}
+
+impl Default for McpAuthConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            bao_addr: "https://bao.bao.svc.cluster.local:8200".to_string(),
+            bao_ca_cert: "/etc/openbao/ca/ca.crt".to_string(),
+            bao_auth_mount: "k8s-doks".to_string(),
+            bao_auth_role: "agent-mcp".to_string(),
+            sa_token_path: "/var/run/secrets/mcp-auth/token".to_string(),
+        }
+    }
+}
+
 /// Top-level kernel configuration.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -991,6 +1095,11 @@ pub struct KernelConfig {
     /// require a `Authorization: Bearer <key>` header.
     /// If empty, the API is unauthenticated (local development only).
     pub api_key: String,
+    /// Maximum message size in bytes for API and WebSocket endpoints.
+    /// Applies to `/api/agents/:id/message`, `/api/agents/:id/message/stream`,
+    /// and WebSocket chat. Default: 1MB (1048576 bytes).
+    #[serde(default = "default_max_message_bytes")]
+    pub max_message_bytes: usize,
     /// Kernel operating mode (stable, default, dev).
     #[serde(default)]
     pub mode: KernelMode,
@@ -1107,6 +1216,17 @@ pub struct KernelConfig {
     /// Heartbeat monitor settings.
     #[serde(default)]
     pub heartbeat: HeartbeatSettings,
+    /// Programmatic Tool Calling (PTC) configuration.
+    /// When enabled (default), agents get a single `execute_code` tool instead of
+    /// 50+ individual tool schemas, reducing context usage by 30-40%+.
+    #[serde(default)]
+    pub ptc: PtcConfig,
+    /// MCP authentication via OpenBao.
+    /// When enabled, authenticates to OpenBao using the pod's per-user K8s
+    /// ServiceAccount token and sends the resulting Vault token as
+    /// `Authorization: Bearer` on all MCP requests.
+    #[serde(default)]
+    pub mcp_auth: McpAuthConfig,
 }
 
 /// Heartbeat monitor settings exposed in `[heartbeat]` config section.
@@ -1231,6 +1351,7 @@ pub struct McpServerConfigEntry {
     pub env: Vec<String>,
     /// Extra HTTP headers for SSE / Streamable-HTTP transports.
     /// Each entry is `"Header-Name: value"` (e.g., `"Authorization: Bearer <token>"`).
+    /// Ignored for stdio transport.
     #[serde(default)]
     pub headers: Vec<String>,
 }
@@ -1294,6 +1415,10 @@ fn default_thread_ttl() -> u64 {
     24
 }
 
+fn default_max_message_bytes() -> usize {
+    1_048_576 // 1MB
+}
+
 impl Default for KernelConfig {
     fn default() -> Self {
         let home_dir = openfang_home_dir();
@@ -1308,6 +1433,7 @@ impl Default for KernelConfig {
             network: NetworkConfig::default(),
             channels: ChannelsConfig::default(),
             api_key: String::new(),
+            max_message_bytes: default_max_message_bytes(),
             mode: KernelMode::default(),
             language: "en".to_string(),
             users: Vec::new(),
@@ -1344,6 +1470,8 @@ impl Default for KernelConfig {
             auth: AuthConfig::default(),
             workflows_dir: None,
             heartbeat: HeartbeatSettings::default(),
+            ptc: PtcConfig::default(),
+            mcp_auth: McpAuthConfig::default(),
         }
     }
 }
@@ -1399,6 +1527,7 @@ impl std::fmt::Debug for KernelConfig {
                     "<redacted>"
                 },
             )
+            .field("max_message_bytes", &self.max_message_bytes)
             .field("mode", &self.mode)
             .field("language", &self.language)
             .field("users", &format!("{} user(s)", self.users.len()))
@@ -1524,7 +1653,10 @@ pub struct MemoryConfig {
     /// How often to run memory consolidation (hours). 0 = disabled.
     #[serde(default = "default_consolidation_interval")]
     pub consolidation_interval_hours: u64,
-    /// Memory backend: "sqlite" (default) or "http".
+    /// Memory backend: "sqlite" (default), "http", or "hindsight".
+    /// When set to "hindsight", semantic memory operations (remember, recall,
+    /// forget) are routed to a Hindsight server while structured ops (KV,
+    /// sessions, tasks) remain on the local SQLite database.
     #[serde(default = "default_memory_backend")]
     pub backend: String,
     /// HTTP memory API URL (when backend = "http").
@@ -1534,6 +1666,15 @@ pub struct MemoryConfig {
     /// Env var name holding the HTTP memory API bearer token.
     #[serde(default)]
     pub http_token_env: Option<String>,
+    /// Hindsight server URL (e.g., "http://hindsight.dialogue.svc:8888").
+    /// Only used when `backend = "hindsight"`.
+    #[serde(default)]
+    pub hindsight_url: Option<String>,
+    /// Environment variable name containing the auth token for Hindsight.
+    /// The value is sent as `Authorization: Bearer {token}`.
+    /// Only used when `backend = "hindsight"`.
+    #[serde(default)]
+    pub hindsight_auth_env: Option<String>,
 }
 
 fn default_consolidation_interval() -> u64 {
@@ -1557,6 +1698,8 @@ impl Default for MemoryConfig {
             backend: default_memory_backend(),
             http_url: None,
             http_token_env: None,
+            hindsight_url: None,
+            hindsight_auth_env: None,
         }
     }
 }
@@ -1702,6 +1845,9 @@ pub struct ChannelsConfig {
     pub wecom: Option<WeComConfig>,
     /// MQTT pub/sub configuration (None = disabled).
     pub mqtt: Option<MqttConfig>,
+    /// Dialogue proxy configuration — outbound-only adapters that relay messages
+    /// through Dialogue's channel-router service (None = disabled).
+    pub dialogue_proxy: Option<DialogueProxyConfig>,
 }
 
 /// Telegram channel adapter configuration.
@@ -3105,6 +3251,38 @@ impl Default for WebhookConfig {
             callback_url: None,
             default_agent: None,
             overrides: ChannelOverrides::default(),
+        }
+    }
+}
+
+/// Dialogue proxy channel adapter configuration.
+///
+/// Outbound-only adapter that proxies `channel_send` calls through Dialogue's
+/// shared channel-router service. Each configured channel name gets its own
+/// adapter instance so agents can call `channel_send(channel="telegram", ...)`
+/// transparently.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DialogueProxyConfig {
+    /// URL of the channel-router outbound endpoint
+    /// (e.g., "http://channel-router.dialogue.svc.cluster.local:8021/send").
+    pub callback_url: String,
+    /// Env var name holding the pod's API key for authentication.
+    pub api_key_env: String,
+    /// Env var name holding the Dialogue user ID (pod owner).
+    pub user_id_env: String,
+    /// Channel names to register proxy adapters for (e.g., ["telegram", "slack"]).
+    /// Each name gets its own adapter instance.
+    pub channels: Vec<String>,
+}
+
+impl Default for DialogueProxyConfig {
+    fn default() -> Self {
+        Self {
+            callback_url: String::new(),
+            api_key_env: "OPENFANG_API_KEY".to_string(),
+            user_id_env: "DIALOGUE_USER_ID".to_string(),
+            channels: vec![],
         }
     }
 }

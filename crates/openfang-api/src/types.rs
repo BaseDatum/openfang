@@ -107,3 +107,40 @@ pub struct ClawHubInstallRequest {
     /// ClawHub skill slug (e.g., "github-helper").
     pub slug: String,
 }
+
+/// Query parameters for cross-agent context search.
+#[derive(Debug, Deserialize)]
+pub struct ContextSearchQuery {
+    /// Search query string.
+    pub query: String,
+    /// Agent ID, name, or "all" for broadcast search.
+    #[serde(default = "default_agent_all")]
+    pub agent_id: String,
+    /// Maximum results (default: 5, max: 50).
+    #[serde(default = "default_max_results")]
+    pub max_results: usize,
+    /// Time window in minutes (optional, max: 1440).
+    pub time_window_minutes: Option<u64>,
+}
+
+fn default_agent_all() -> String {
+    "all".to_string()
+}
+
+fn default_max_results() -> usize {
+    5
+}
+
+/// Query parameters for agent context retrieval.
+#[derive(Debug, Deserialize)]
+pub struct ContextGetQuery {
+    /// Maximum messages to return (default: 10, max: 100).
+    #[serde(default = "default_max_messages")]
+    pub max_messages: usize,
+    /// Time window in minutes (optional, max: 1440).
+    pub time_window_minutes: Option<u64>,
+}
+
+fn default_max_messages() -> usize {
+    10
+}

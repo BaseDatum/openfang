@@ -62,7 +62,12 @@ pub trait KernelHandle: Send + Sync {
     ) -> Result<String, String>;
 
     /// Claim the next available task (optionally filtered by assignee). Returns task JSON or None.
-    async fn task_claim(&self, agent_id: &str) -> Result<Option<serde_json::Value>, String>;
+    /// `agent_name` allows matching tasks assigned by human-readable name (not just UUID).
+    async fn task_claim(
+        &self,
+        agent_id: &str,
+        agent_name: Option<&str>,
+    ) -> Result<Option<serde_json::Value>, String>;
 
     /// Mark a task as completed with a result string.
     async fn task_complete(&self, task_id: &str, result: &str) -> Result<(), String>;
@@ -94,6 +99,31 @@ pub trait KernelHandle: Send + Sync {
         &self,
         pattern: openfang_types::memory::GraphPattern,
     ) -> Result<Vec<openfang_types::memory::GraphMatch>, String>;
+
+    /// Explicitly retain a memory fact (Hindsight backend only).
+    async fn memory_retain(
+        &self,
+        agent_id: &str,
+        content: &str,
+        context: &str,
+        tags: Option<Vec<String>>,
+        metadata: Option<std::collections::HashMap<String, String>>,
+        timestamp: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = (agent_id, content, context, tags, metadata, timestamp);
+        Err("memory_retain requires hindsight backend".to_string())
+    }
+
+    /// Synthesized reasoning across stored memories (Hindsight backend only).
+    async fn memory_reflect(
+        &self,
+        agent_id: &str,
+        query: &str,
+        budget: Option<&str>,
+    ) -> Result<String, String> {
+        let _ = (agent_id, query, budget);
+        Err("memory_reflect requires hindsight backend".to_string())
+    }
 
     /// Create a cron job for the calling agent.
     async fn cron_create(
@@ -244,6 +274,13 @@ pub trait KernelHandle: Send + Sync {
         let _ = agent_id;
     }
 
+    /// Touch the agent's `last_active` timestamp to signal the heartbeat monitor
+    /// that the agent is alive. Called during long-running PTC tool execution so
+    /// the agent isn't incorrectly marked as unresponsive.
+    fn touch_active(&self, _agent_id: &str) {
+        // Default: no-op. The kernel overrides this to update the registry.
+    }
+
     /// Spawn an agent with capability inheritance enforcement.
     /// `parent_caps` are the parent's granted capabilities. The kernel MUST verify
     /// that every capability in the child manifest is covered by `parent_caps`.
@@ -257,5 +294,68 @@ pub trait KernelHandle: Send + Sync {
         // The kernel MUST override this with real enforcement
         let _ = parent_caps;
         self.spawn_agent(manifest_toml, parent_id).await
+    }
+
+    // -----------------------------------------------------------------
+    // Cross-agent context search (Issue #13)
+    // -----------------------------------------------------------------
+
+    /// Get recent context (conversation history) from an agent's canonical session.
+    /// Returns timestamped messages as JSON objects.
+    /// `time_window_minutes` optionally filters to only messages within that window.
+    async fn get_agent_context(
+        &self,
+        agent_id: &str,
+        max_messages: usize,
+        time_window_minutes: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let _ = (agent_id, max_messages, time_window_minutes);
+        Err("Context search not available".to_string())
+    }
+
+    /// Search across agent context windows and semantic memories.
+    /// If `agent_id` is "all", searches all agents. Otherwise, searches a specific agent.
+    /// Uses keyword matching (Phase 1) with optional time window filter.
+    async fn search_agent_context(
+        &self,
+        agent_id: &str,
+        query: &str,
+        max_results: usize,
+        time_window_minutes: Option<u64>,
+    ) -> Result<Vec<serde_json::Value>, String> {
+        let _ = (agent_id, query, max_results, time_window_minutes);
+        Err("Context search not available".to_string())
+    }
+
+    /// List active agents with lightweight context summaries (message count,
+    /// last activity timestamp, last message preview).
+    fn list_active_agents_with_context(&self) -> Vec<serde_json::Value> {
+        vec![]
+    }
+
+    // -----------------------------------------------------------------
+    // Client-side tool execution (meeting control tools)
+    // -----------------------------------------------------------------
+
+    /// Execute a client-side tool by forwarding it to the connected client
+    /// (macOS/iOS app) via WebSocket.
+    ///
+    /// The kernel implementation sends a `client_tool_call` event over the
+    /// WS and waits for a `client_tool_result` response from the client.
+    ///
+    /// `agent_id` identifies the calling agent so the broadcast can be
+    /// scoped to the correct WS connection (prevents duplicate execution
+    /// when multiple agents are connected simultaneously).
+    ///
+    /// Returns the tool result content on success, or an error string.
+    async fn execute_client_tool(
+        &self,
+        agent_id: &str,
+        tool_name: &str,
+        tool_use_id: &str,
+        input: &serde_json::Value,
+    ) -> Result<String, String> {
+        let _ = (agent_id, tool_name, tool_use_id, input);
+        Err("Client tool execution not available (no connected client)".to_string())
     }
 }

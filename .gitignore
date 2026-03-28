@@ -5,6 +5,7 @@
 
 # Environment & secrets
 .env
+remote.env
 .env.*
 !.env.example
 

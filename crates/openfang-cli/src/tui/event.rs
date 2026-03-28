@@ -303,9 +303,12 @@ pub fn spawn_inprocess_stream(
         // send_message_streaming() finds the reactor.
         let _guard = rt.enter();
 
-        match kernel.send_message_streaming(agent_id, &message, None, None, None, None) {
-            Ok((mut rx, handle)) => {
-                rt.block_on(async {
+        rt.block_on(async {
+            match kernel
+                .send_message_streaming(agent_id, &message, None, None, None, None)
+                .await
+            {
+                Ok((mut rx, handle)) => {
                     while let Some(ev) = rx.recv().await {
                         if tx.send(AppEvent::Stream(ev)).is_err() {
                             return;
@@ -316,12 +319,12 @@ pub fn spawn_inprocess_stream(
                         .map_err(|e| e.to_string())
                         .and_then(|r| r.map_err(|e| e.to_string()));
                     let _ = tx.send(AppEvent::StreamDone(result));
-                });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppEvent::StreamDone(Err(format!("{e}"))));
+                }
             }
-            Err(e) => {
-                let _ = tx.send(AppEvent::StreamDone(Err(format!("{e}"))));
-            }
-        }
+        });
     });
 }
 
@@ -1157,7 +1160,8 @@ pub fn spawn_update_agent_skills(
         BackendRef::InProcess(kernel) => {
             if let Ok(uuid) = uuid::Uuid::parse_str(&agent_id) {
                 let aid = openfang_types::agent::AgentId(uuid);
-                match kernel.set_agent_skills(aid, skills) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                match rt.block_on(kernel.set_agent_skills(aid, skills)) {
                     Ok(()) => {
                         let _ = tx.send(AppEvent::AgentSkillsUpdated(agent_id));
                     }
@@ -1201,7 +1205,8 @@ pub fn spawn_update_agent_mcp_servers(
         BackendRef::InProcess(kernel) => {
             if let Ok(uuid) = uuid::Uuid::parse_str(&agent_id) {
                 let aid = openfang_types::agent::AgentId(uuid);
-                match kernel.set_agent_mcp_servers(aid, servers) {
+                let rt = tokio::runtime::Runtime::new().unwrap();
+                match rt.block_on(kernel.set_agent_mcp_servers(aid, servers)) {
                     Ok(()) => {
                         let _ = tx.send(AppEvent::AgentMcpServersUpdated(agent_id));
                     }

@@ -81,6 +81,34 @@ fn check_taint_net_fetch(url: &str) -> Option<String> {
     None
 }
 
+/// Names of tools that are executed client-side (macOS/iOS app) rather
+/// than in the OpenFang kernel. These tools control the meeting UI:
+/// speaker names, document editing, participants, etc.
+const CLIENT_TOOL_NAMES: &[&str] = &[
+    "get_meeting_state",
+    "get_speaker_map",
+    "get_participants",
+    "rename_speaker",
+    "set_meeting_title",
+    "link_calendar_event",
+    "add_participant",
+    "remove_participant",
+    "set_participants",
+    "correct_transcript",
+    "read_document",
+    "insert_blocks",
+    "update_block",
+    "delete_block",
+    "append_markdown",
+    "search_notes",
+    "propose_github_issue",
+];
+
+/// Check if a tool name is a client-side tool.
+fn is_client_tool(name: &str) -> bool {
+    CLIENT_TOOL_NAMES.contains(&name)
+}
+
 tokio::task_local! {
     /// Tracks the current inter-agent call depth within a task.
     static AGENT_CALL_DEPTH: std::cell::Cell<u32>;
@@ -301,6 +329,11 @@ pub async fn execute_tool(
         "memory_store" => tool_memory_store(input, kernel),
         "memory_recall" => tool_memory_recall(input, kernel),
 
+        // Cross-agent context search tools
+        "context_search" => tool_context_search(input, kernel).await,
+        "context_get" => tool_context_get(input, kernel).await,
+        "context_agents" => tool_context_agents(kernel),
+
         // Collaboration tools
         "agent_find" => tool_agent_find(input, kernel),
         "task_post" => tool_task_post(input, kernel, caller_agent_id).await,
@@ -318,6 +351,10 @@ pub async fn execute_tool(
         "knowledge_add_entity" => tool_knowledge_add_entity(input, kernel).await,
         "knowledge_add_relation" => tool_knowledge_add_relation(input, kernel).await,
         "knowledge_query" => tool_knowledge_query(input, kernel).await,
+
+        // Hindsight memory tools (memory_retain, memory_reflect)
+        "memory_retain" => tool_memory_retain(input, kernel, caller_agent_id).await,
+        "memory_reflect" => tool_memory_reflect(input, kernel, caller_agent_id).await,
 
         // Image analysis tool
         "image_analyze" => tool_image_analyze(input).await,
@@ -475,8 +512,23 @@ pub async fn execute_tool(
         "canvas_present" => tool_canvas_present(input, workspace_root).await,
 
         other => {
+            // Fallback 0: Client-side tools — forwarded to the connected
+            // macOS/iOS client via WebSocket for local execution.
+            // These tools control the meeting UI: speaker names, document
+            // editing, participants, calendar, transcript corrections, etc.
+            if is_client_tool(other) {
+                if let Some(kh) = kernel {
+                    let aid = caller_agent_id.unwrap_or("");
+                    match kh.execute_client_tool(aid, other, tool_use_id, input).await {
+                        Ok(content) => Ok(content),
+                        Err(e) => Err(format!("Client tool failed: {e}")),
+                    }
+                } else {
+                    Err("Client tools require a connected client (no kernel handle available)".to_string())
+                }
+            }
             // Fallback 1: MCP tools (mcp_{server}_{tool} prefix)
-            if mcp::is_mcp_tool(other) {
+            else if mcp::is_mcp_tool(other) {
                 if let Some(mcp_conns) = mcp_connections {
                     let mut conns = mcp_conns.lock().await;
                     let known_names: Vec<String> =
@@ -697,7 +749,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "key": { "type": "string", "description": "The storage key" },
-                    "value": { "type": "string", "description": "The value to store (JSON-encode objects/arrays, or pass a plain string)" }
+                    "value": { "description": "The value to store (string, number, boolean, object, or array)" }
                 },
                 "required": ["key", "value"]
             }),
@@ -778,6 +830,42 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "payload": { "type": "object", "description": "JSON payload data for the event" }
                 },
                 "required": ["event_type"]
+            }),
+        },
+        // --- Cross-agent context search tools ---
+        ToolDefinition {
+            name: "context_search".to_string(),
+            description: "Search across other agents' conversation context and memories in real time. Use to find what other agents have seen, discussed, or learned. Set agent_id to 'all' for broadcast search, or a specific agent ID/name.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Target agent ID, name, or 'all' for broadcast search" },
+                    "query": { "type": "string", "description": "Natural language or keyword query to search for" },
+                    "max_results": { "type": "integer", "description": "Maximum results to return (default: 5, max: 50)" },
+                    "time_window_minutes": { "type": "integer", "description": "Only search within the last N minutes (default: 30, max: 1440)" }
+                },
+                "required": ["agent_id", "query"]
+            }),
+        },
+        ToolDefinition {
+            name: "context_get".to_string(),
+            description: "Get recent conversation context from a specific agent's session. Returns recent messages and memory without triggering an LLM call. Lightweight alternative to agent_send for reading context.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "agent_id": { "type": "string", "description": "Target agent ID or name" },
+                    "max_messages": { "type": "integer", "description": "Maximum messages to return (default: 10, max: 100)" },
+                    "time_window_minutes": { "type": "integer", "description": "Only include context from the last N minutes (optional, max: 1440)" }
+                },
+                "required": ["agent_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "context_agents".to_string(),
+            description: "List all active agents with context summaries: message count, last activity, last message preview. Use for dashboard-style awareness of what all agents are doing.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {}
             }),
         },
         // --- Scheduling tools ---
@@ -1066,12 +1154,12 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
         // --- Channel send tool (proactive outbound messaging) ---
         ToolDefinition {
             name: "channel_send".to_string(),
-            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic.".to_string(),
+            description: "Send a message or media to a user on a configured channel (email, telegram, slack, etc). For email: recipient is the email address; optionally set subject. For chat channels (telegram, slack): omit recipient to send to the default/linked user. For media: set image_url, file_url, or file_path to send an image or file instead of (or alongside) text. Use thread_id to reply in a specific thread/topic.".to_string(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "properties": {
                     "channel": { "type": "string", "description": "Channel adapter name (e.g., 'email', 'telegram', 'slack', 'discord')" },
-                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier (email address, user ID, etc.)" },
+                    "recipient": { "type": "string", "description": "Platform-specific recipient identifier. For email: the email address (required). For chat channels like telegram/slack: omit to send to the default/linked user." },
                     "subject": { "type": "string", "description": "Optional subject line (used for email; ignored for other channels)" },
                     "message": { "type": "string", "description": "The message body to send (required for text, optional caption for media)" },
                     "image_url": { "type": "string", "description": "URL of an image to send (supported on Telegram, Discord, Slack)" },
@@ -1080,7 +1168,7 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "filename": { "type": "string", "description": "Filename for file attachments (defaults to the basename of file_path, or 'file')" },
                     "thread_id": { "type": "string", "description": "Thread/topic ID to reply in (e.g., Telegram message_thread_id, Slack thread_ts)" }
                 },
-                "required": ["channel", "recipient"]
+                "required": ["channel"]
             }),
         },
         // --- Hand tools (curated autonomous capability packages) ---
@@ -1270,6 +1358,270 @@ pub fn builtin_tool_definitions() -> Vec<ToolDefinition> {
                     "title": { "type": "string", "description": "Optional title for the canvas panel" }
                 },
                 "required": ["html"]
+            }),
+        },
+        // --- Client-side meeting control tools ---
+        // These are executed on the connected macOS/iOS client, not in the kernel.
+        ToolDefinition {
+            name: "get_meeting_state".to_string(),
+            description: "Get the current meeting state: title, duration, participants, speakers, segment count, and speaker name map.".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDefinition {
+            name: "get_speaker_map".to_string(),
+            description: "Get the current speaker display name map (diarizer label → human name).".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDefinition {
+            name: "rename_speaker".to_string(),
+            description: "Rename a speaker in the live transcript. Maps a diarizer label (e.g. 'Speaker-0') to a human name (e.g. 'Sarah Chen'). The change appears immediately in the user's transcript view.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "old_name": { "type": "string", "description": "Current diarizer label (e.g. 'Speaker-0', 'Local-Speaker-1')" },
+                    "new_name": { "type": "string", "description": "Human-friendly display name (e.g. 'Sarah Chen')" }
+                },
+                "required": ["old_name", "new_name"]
+            }),
+        },
+        ToolDefinition {
+            name: "get_participants".to_string(),
+            description: "Get the current participant list for the meeting.".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDefinition {
+            name: "add_participant".to_string(),
+            description: "Add a participant to the meeting.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Participant name" },
+                    "email": { "type": "string", "description": "Optional email address" },
+                    "role": { "type": "string", "description": "Optional role/title" }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolDefinition {
+            name: "remove_participant".to_string(),
+            description: "Remove a participant from the meeting.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": { "type": "string", "description": "Name of the participant to remove" }
+                },
+                "required": ["name"]
+            }),
+        },
+        ToolDefinition {
+            name: "set_participants".to_string(),
+            description: "Set the full participant list for the meeting (replaces existing).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "participants": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string" },
+                                "email": { "type": "string" },
+                                "role": { "type": "string" }
+                            },
+                            "required": ["name"]
+                        },
+                        "description": "Array of participant objects"
+                    }
+                },
+                "required": ["participants"]
+            }),
+        },
+        ToolDefinition {
+            name: "set_meeting_title".to_string(),
+            description: "Set the meeting title (renames the note).".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "New meeting title" }
+                },
+                "required": ["title"]
+            }),
+        },
+        ToolDefinition {
+            name: "link_calendar_event".to_string(),
+            description: "Link a calendar event to this meeting note.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "title": { "type": "string", "description": "Calendar event title" },
+                    "event_id": { "type": "string", "description": "Optional calendar event ID" },
+                    "date": { "type": "string", "description": "Optional event date (ISO 8601)" }
+                },
+                "required": ["title"]
+            }),
+        },
+        ToolDefinition {
+            name: "correct_transcript".to_string(),
+            description: "Correct the text of a specific transcript segment.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "segment_id": { "type": "string", "description": "UUID (or prefix) of the transcript segment to correct" },
+                    "corrected_text": { "type": "string", "description": "The corrected text" }
+                },
+                "required": ["segment_id", "corrected_text"]
+            }),
+        },
+        ToolDefinition {
+            name: "read_document".to_string(),
+            description: "Read the current BlockNote document content as JSON.".to_string(),
+            input_schema: serde_json::json!({"type": "object", "properties": {}}),
+        },
+        ToolDefinition {
+            name: "insert_blocks".to_string(),
+            description: "Insert BlockNote blocks at a position in the document without moving the user's cursor.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "blocks_json": { "type": "string", "description": "JSON array of BlockNote block objects to insert" },
+                    "position": { "type": "string", "enum": ["start", "end", "before", "after"], "description": "Where to insert relative to anchor_block_id (default: end)" },
+                    "anchor_block_id": { "type": "string", "description": "Block ID to insert before/after (required for 'before'/'after' positions)" }
+                },
+                "required": ["blocks_json"]
+            }),
+        },
+        ToolDefinition {
+            name: "update_block".to_string(),
+            description: "Update a single block's content in-place without disrupting the user's cursor.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "block_id": { "type": "string", "description": "The block ID to update" },
+                    "content_json": { "type": "string", "description": "New content for the block (BlockNote block JSON)" }
+                },
+                "required": ["block_id", "content_json"]
+            }),
+        },
+        ToolDefinition {
+            name: "delete_block".to_string(),
+            description: "Delete a block from the document.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "block_id": { "type": "string", "description": "The block ID to delete" }
+                },
+                "required": ["block_id"]
+            }),
+        },
+        ToolDefinition {
+            name: "append_markdown".to_string(),
+            description: "Append markdown content to the end of the document. Use this for adding structured notes (headings, bullet lists, tables) without replacing existing content.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "markdown": { "type": "string", "description": "Markdown content to append" }
+                },
+                "required": ["markdown"]
+            }),
+        },
+        ToolDefinition {
+            name: "search_notes".to_string(),
+            description: "Search across all of the user's notes and meeting transcripts. Returns matching titles, snippets, and references.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "Search query" },
+                    "limit": { "type": "integer", "description": "Max results to return (default: 10)" }
+                },
+                "required": ["query"]
+            }),
+        },
+        ToolDefinition {
+            name: "propose_github_issue".to_string(),
+            description: "Insert an interactive action block into the document that lets the user create a GitHub issue with one click. This does NOT create the issue — it proposes it. The user reviews the pre-filled details and clicks a button to actually create it. Use this when a bug, feature request, or task comes up in conversation that should become a GitHub issue. Use MCP github tools instead if you need to create the issue directly without user review.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "owner": { "type": "string", "description": "GitHub repository owner (user or org)" },
+                    "repo": { "type": "string", "description": "GitHub repository name" },
+                    "title": { "type": "string", "description": "Issue title" },
+                    "body": { "type": "string", "description": "Issue body (markdown supported)" },
+                    "labels": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional labels to apply to the issue"
+                    }
+                },
+                "required": ["owner", "repo", "title"]
+            }),
+        },
+    ]
+}
+
+/// Tool definitions for Hindsight-specific memory tools.
+///
+/// These are registered conditionally — only when `memory.backend = "hindsight"`.
+/// They are NOT included in `builtin_tool_definitions()` to avoid showing them
+/// to agents running on the SQLite backend.
+pub fn hindsight_tool_definitions() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: "memory_retain".to_string(),
+            description: "Explicitly store an important fact or memory. Use for key information \
+                the user shares that you want to ensure is remembered long-term. Conversations \
+                are automatically retained, but use this tool to emphasize critical facts or \
+                store information from external sources."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "content": {
+                        "type": "string",
+                        "description": "The fact or memory to store (be specific and include context)"
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Category for the memory (e.g., 'preferences', 'work', 'personal', 'technical'). Default: 'general'"
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional tags for organizing and filtering (e.g., ['project:alpha'])"
+                    },
+                    "metadata": {
+                        "type": "object",
+                        "description": "Optional key-value metadata (e.g., {\"source\": \"email\", \"priority\": \"high\"})"
+                    },
+                    "timestamp": {
+                        "type": "string",
+                        "description": "When this fact occurred (ISO 8601, e.g., '2024-01-15T10:30:00Z'). Omit for 'now'."
+                    }
+                },
+                "required": ["content"]
+            }),
+        },
+        ToolDefinition {
+            name: "memory_reflect".to_string(),
+            description: "Synthesize and reason across stored memories to answer a question. \
+                Unlike recall (which returns raw facts), reflect thinks through the question \
+                using everything known about the user and produces a reasoned analysis. \
+                Use for questions like 'what patterns have emerged', 'what should I prioritize', \
+                or 'what approach would suit me best'."
+                .to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The question or topic to reflect on"
+                    },
+                    "budget": {
+                        "type": "string",
+                        "enum": ["low", "mid", "high"],
+                        "description": "Search depth - 'low' for quick synthesis, 'high' for thorough analysis. Default: 'low'"
+                    }
+                },
+                "required": ["query"]
             }),
         },
     ]
@@ -1667,7 +2019,7 @@ fn tool_agent_list(kernel: Option<&Arc<dyn KernelHandle>>) -> Result<String, Str
     let kh = require_kernel(kernel)?;
     let agents = kh.list_agents();
     if agents.is_empty() {
-        return Ok("No agents currently running.".to_string());
+        return Ok("[]".to_string());
     }
     let mut output = format!("Running agents ({}):\n", agents.len());
     for a in &agents {
@@ -1713,9 +2065,90 @@ fn tool_memory_recall(
     let kh = require_kernel(kernel)?;
     let key = input["key"].as_str().ok_or("Missing 'key' parameter")?;
     match kh.memory_recall(key)? {
-        Some(val) => Ok(serde_json::to_string_pretty(&val).unwrap_or_else(|_| val.to_string())),
+        Some(val) => match &val {
+            // Return raw string content to avoid double-encoding.
+            // When an LLM stores `json.dumps({...})` via PTC, the value is
+            // `Value::String("{...}")`. Without this unwrap, `to_string_pretty`
+            // would produce `"\"{...}\""` — a double-encoded string that the
+            // caller must parse twice.
+            serde_json::Value::String(s) => Ok(s.clone()),
+            other => Ok(serde_json::to_string_pretty(other)
+                .unwrap_or_else(|_| other.to_string())),
+        },
         None => Ok(format!("No value found for key '{key}'.")),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Cross-agent context search tools
+// ---------------------------------------------------------------------------
+
+async fn tool_context_search(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = input["agent_id"]
+        .as_str()
+        .ok_or("Missing 'agent_id' parameter (use agent ID, name, or 'all')")?;
+    let query = input["query"]
+        .as_str()
+        .ok_or("Missing 'query' parameter")?;
+    let max_results = input["max_results"].as_u64().unwrap_or(5) as usize;
+    let time_window = input["time_window_minutes"].as_u64();
+
+    let results = kh
+        .search_agent_context(agent_id, query, max_results, time_window)
+        .await?;
+
+    if results.is_empty() {
+        return Ok(format!(
+            "No context matching '{}' found across {}.",
+            query,
+            if agent_id == "all" {
+                "any agents".to_string()
+            } else {
+                format!("agent '{agent_id}'")
+            }
+        ));
+    }
+
+    serde_json::to_string_pretty(&results).map_err(|e| format!("Serialize failed: {e}"))
+}
+
+async fn tool_context_get(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = input["agent_id"]
+        .as_str()
+        .ok_or("Missing 'agent_id' parameter")?;
+    let max_messages = input["max_messages"].as_u64().unwrap_or(10) as usize;
+    let time_window = input["time_window_minutes"].as_u64();
+
+    let results = kh
+        .get_agent_context(agent_id, max_messages, time_window)
+        .await?;
+
+    if results.is_empty() {
+        return Ok(format!("No context available for agent '{agent_id}'."));
+    }
+
+    serde_json::to_string_pretty(&results).map_err(|e| format!("Serialize failed: {e}"))
+}
+
+fn tool_context_agents(
+    kernel: Option<&Arc<dyn KernelHandle>>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agents = kh.list_active_agents_with_context();
+
+    if agents.is_empty() {
+        return Ok("No active agents.".to_string());
+    }
+
+    serde_json::to_string_pretty(&agents).map_err(|e| format!("Serialize failed: {e}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -1772,11 +2205,21 @@ async fn tool_task_claim(
 ) -> Result<String, String> {
     let kh = require_kernel(kernel)?;
     let agent_id = caller_agent_id.unwrap_or("");
-    match kh.task_claim(agent_id).await? {
+    // Resolve the caller's human-readable agent name so task_claim can match
+    // tasks assigned by name (e.g. "get-it-done-hand") in addition to UUID.
+    let agent_name = if !agent_id.is_empty() {
+        kh.list_agents()
+            .iter()
+            .find(|a| a.id == agent_id)
+            .map(|a| a.name.clone())
+    } else {
+        None
+    };
+    match kh.task_claim(agent_id, agent_name.as_deref()).await? {
         Some(task) => {
             serde_json::to_string_pretty(&task).map_err(|e| format!("Serialize error: {e}"))
         }
-        None => Ok("No tasks available.".to_string()),
+        None => Ok("null".to_string()),
     }
 }
 
@@ -1803,7 +2246,7 @@ async fn tool_task_list(
     let status = input["status"].as_str();
     let tasks = kh.task_list(status).await?;
     if tasks.is_empty() {
-        return Ok("No tasks found.".to_string());
+        return Ok("[]".to_string());
     }
     serde_json::to_string_pretty(&tasks).map_err(|e| format!("Serialize error: {e}"))
 }
@@ -1959,6 +2402,48 @@ async fn tool_knowledge_query(
         ));
     }
     Ok(output)
+}
+
+// ---------------------------------------------------------------------------
+// Hindsight memory tools (memory_retain, memory_reflect)
+// ---------------------------------------------------------------------------
+
+async fn tool_memory_retain(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = caller_agent_id.ok_or("No caller agent ID")?;
+    let content = input["content"]
+        .as_str()
+        .ok_or("Missing 'content' parameter")?;
+    let context = input["context"].as_str().unwrap_or("general");
+    let tags: Option<Vec<String>> = input
+        .get("tags")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let metadata: Option<std::collections::HashMap<String, String>> = input
+        .get("metadata")
+        .and_then(|v| serde_json::from_value(v.clone()).ok());
+    let timestamp = input["timestamp"].as_str();
+
+    kh.memory_retain(agent_id, content, context, tags, metadata, timestamp)
+        .await
+}
+
+async fn tool_memory_reflect(
+    input: &serde_json::Value,
+    kernel: Option<&Arc<dyn KernelHandle>>,
+    caller_agent_id: Option<&str>,
+) -> Result<String, String> {
+    let kh = require_kernel(kernel)?;
+    let agent_id = caller_agent_id.ok_or("No caller agent ID")?;
+    let query = input["query"]
+        .as_str()
+        .ok_or("Missing 'query' parameter")?;
+    let budget = input["budget"].as_str();
+
+    kh.memory_reflect(agent_id, query, budget).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2237,18 +2722,13 @@ async fn tool_channel_send(
         .map(|s| s.trim().to_string())
         .unwrap_or_default();
 
-    // If recipient is empty, resolve from channel's default_chat_id config.
+    // If recipient is empty, try to resolve from the channel's default config.
+    // For proxy adapters (e.g., Dialogue), an empty recipient is normal — the
+    // proxy resolves the destination from its own user context.
     let recipient = if recipient_input.is_empty() {
-        let default_id = kh.get_channel_default_recipient(&channel).await;
-        match default_id {
-            Some(id) => id,
-            None => {
-                return Err(format!(
-                "Missing 'recipient' parameter. Set default_chat_id in [channels.{channel}] config \
-                 or pass recipient explicitly."
-            ))
-            }
-        }
+        kh.get_channel_default_recipient(&channel)
+            .await
+            .unwrap_or_default()
     } else {
         recipient_input
     };
@@ -3298,8 +3778,8 @@ mod tests {
     fn test_builtin_tool_definitions() {
         let tools = builtin_tool_definitions();
         assert!(
-            tools.len() >= 39,
-            "Expected at least 39 tools, got {}",
+            tools.len() >= 42,
+            "Expected at least 42 tools, got {}",
             tools.len()
         );
         let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
@@ -3319,6 +3799,10 @@ mod tests {
         assert!(names.contains(&"task_complete"));
         assert!(names.contains(&"task_list"));
         assert!(names.contains(&"event_publish"));
+        // 3 cross-agent context search tools
+        assert!(names.contains(&"context_search"));
+        assert!(names.contains(&"context_get"));
+        assert!(names.contains(&"context_agents"));
         // 5 new Phase 3 tools
         assert!(names.contains(&"schedule_create"));
         assert!(names.contains(&"schedule_list"));

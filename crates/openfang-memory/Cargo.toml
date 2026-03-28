@@ -7,7 +7,8 @@ description = "Memory substrate for the OpenFang Agent OS"
 
 [features]
 default = ["http-memory"]
-http-memory = ["reqwest"]
+http-memory = ["dep:reqwest"]
+hindsight = ["dep:hindsight-client", "dep:reqwest"]
 
 [dependencies]
 openfang-types = { path = "../openfang-types" }
@@ -22,6 +23,9 @@ thiserror = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
 reqwest = { workspace = true, features = ["blocking"], optional = true }
+
+# Optional: Hindsight semantic memory backend
+hindsight-client = { git = "https://github.com/BaseDatum/hindsight.git", branch = "feat/per-tenant-llm-credentials", optional = true }
 
 [dev-dependencies]
 tokio-test = { workspace = true }

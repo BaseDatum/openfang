@@ -163,6 +163,7 @@ impl SetupWizard {
                 system_prompt,
                 api_key_env: None,
                 base_url: None,
+                thinking: None,
             },
             resources: ResourceQuota::default(),
             priority: Priority::default(),
@@ -182,6 +183,7 @@ impl SetupWizard {
             exec_policy: None,
             tool_allowlist: vec![],
             tool_blocklist: vec![],
+            ptc_enabled: None,
         };
 
         let skills_to_install: Vec<String> = intent

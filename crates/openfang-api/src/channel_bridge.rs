@@ -54,6 +54,8 @@ use openfang_channels::mqtt::MqttAdapter;
 use openfang_channels::ntfy::NtfyAdapter;
 use openfang_channels::webhook::WebhookAdapter;
 use openfang_channels::wecom::WeComAdapter;
+// Dialogue integration
+use openfang_channels::dialogue_proxy::DialogueProxyAdapter;
 use openfang_kernel::OpenFangKernel;
 use openfang_types::agent::AgentId;
 use std::sync::Arc;
@@ -711,6 +713,7 @@ impl ChannelBridgeHandle for KernelBridgeAdapter {
         }
         self.kernel
             .set_agent_model(agent_id, model, None)
+            .await
             .map_err(|e| format!("{e}"))?;
         // Read back resolved model+provider from registry
         let entry = self
@@ -1116,7 +1119,8 @@ pub async fn start_channel_bridge_with_config(
         || config.ntfy.is_some()
         || config.gotify.is_some()
         || config.webhook.is_some()
-        || config.linkedin.is_some();
+        || config.linkedin.is_some()
+        || config.dialogue_proxy.is_some();
 
     if !has_any {
         return (None, Vec::new());
@@ -1697,6 +1701,55 @@ pub async fn start_channel_bridge_with_config(
             mq_config.qos,
         ));
         adapters.push((adapter, mq_config.default_agent.clone()));
+    }
+
+    // Dialogue proxy — outbound-only adapters for Dialogue's multi-tenant architecture.
+    // Registers one adapter per channel name (e.g., "telegram", "slack") that proxies
+    // `channel_send` calls through the Dialogue channel-router service.
+    //
+    // Authentication: when MCP auth is enabled, use the OpenBao Vault token
+    // (obtained via per-user K8s ServiceAccount) instead of the static
+    // OPENFANG_API_KEY.  The channel-router validates this token and extracts
+    // the authenticated user_id from the entity alias.
+    if let Some(ref dp_config) = config.dialogue_proxy {
+        if !dp_config.callback_url.is_empty() && !dp_config.channels.is_empty() {
+            // Authenticate via OpenBao Vault token (MCP auth) or static API key.
+            let auth_token = if kernel.config.mcp_auth.enabled {
+                use openfang_runtime::mcp_auth::McpAuthProvider;
+                let provider = McpAuthProvider::new(kernel.config.mcp_auth.clone());
+                match provider.get_token().await {
+                    Some(token) => token,
+                    None => {
+                        error!("MCP auth enabled but failed to obtain Vault token — channel proxy will not work");
+                        String::new()
+                    }
+                }
+            } else {
+                std::env::var(&dp_config.api_key_env).unwrap_or_default()
+            };
+            if !auth_token.is_empty() {
+                for channel_name in &dp_config.channels {
+                    let adapter: Arc<dyn ChannelAdapter> = Arc::new(DialogueProxyAdapter::new(
+                        channel_name.clone(),
+                        dp_config.callback_url.clone(),
+                        auth_token.clone(),
+                    ));
+                    adapters.push((adapter, None));
+                }
+                info!(
+                    channels = ?dp_config.channels,
+                    callback = %dp_config.callback_url,
+                    mcp_auth = kernel.config.mcp_auth.enabled,
+                    "Dialogue proxy adapters registered",
+                );
+            } else {
+                warn!(
+                    api_key_env = %dp_config.api_key_env,
+                    user_id_env = %dp_config.user_id_env,
+                    "Dialogue proxy: skipping — missing API key or user ID env vars",
+                );
+            }
+        }
     }
 
     if adapters.is_empty() {

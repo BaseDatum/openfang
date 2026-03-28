@@ -452,6 +452,9 @@ impl LlmDriver for OpenAIDriver {
             temperature: if self.needs_reasoning_content(&request.model) {
                 // Kimi with thinking disabled uses fixed 0.6 for multi-turn compatibility.
                 Some(0.6)
+            } else if request.thinking.is_some() {
+                // Anthropic extended thinking requires temperature = 1.
+                Some(1.0)
             } else if temperature_must_be_one(&request.model) {
                 Some(1.0)
             } else if rejects_temperature(&request.model) {
@@ -464,9 +467,13 @@ impl LlmDriver for OpenAIDriver {
             stream: false,
             stream_options: None,
             thinking: if self.needs_reasoning_content(&request.model) {
+                // Disable thinking for Kimi to avoid multi-turn reasoning_content issues.
                 Some(serde_json::json!({"type": "disabled"}))
             } else {
-                None
+                request.thinking.as_ref().map(|t| {
+                    // Enable extended thinking (Claude via OpenRouter or direct Anthropic).
+                    serde_json::json!({"type": "enabled", "budget_tokens": t.budget_tokens})
+                })
             },
         };
 
@@ -907,6 +914,9 @@ impl LlmDriver for OpenAIDriver {
             max_completion_tokens: mct,
             temperature: if self.needs_reasoning_content(&request.model) {
                 Some(0.6)
+            } else if request.thinking.is_some() {
+                // Anthropic extended thinking requires temperature = 1.
+                Some(1.0)
             } else if temperature_must_be_one(&request.model) {
                 Some(1.0)
             } else if rejects_temperature(&request.model) {
@@ -919,9 +929,13 @@ impl LlmDriver for OpenAIDriver {
             stream: true,
             stream_options: Some(serde_json::json!({"include_usage": true})),
             thinking: if self.needs_reasoning_content(&request.model) {
+                // Disable thinking for Kimi to avoid multi-turn reasoning_content issues.
                 Some(serde_json::json!({"type": "disabled"}))
             } else {
-                None
+                request.thinking.as_ref().map(|t| {
+                    // Enable extended thinking (Claude via OpenRouter or direct Anthropic).
+                    serde_json::json!({"type": "enabled", "budget_tokens": t.budget_tokens})
+                })
             },
         };
 

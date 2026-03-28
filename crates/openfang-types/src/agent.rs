@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use uuid::Uuid;
 
 /// Unique identifier for a user.
@@ -80,6 +81,9 @@ pub struct AutonomousConfig {
     pub heartbeat_interval_secs: u64,
     /// Channel to send heartbeat status to (e.g., "telegram", "discord").
     pub heartbeat_channel: Option<String>,
+    /// Maximum wall-clock seconds for a single background tick.
+    /// If a tick exceeds this duration it is cancelled. Default: 300 (5 min).
+    pub max_tick_duration_secs: u64,
 }
 
 impl Default for AutonomousConfig {
@@ -90,6 +94,7 @@ impl Default for AutonomousConfig {
             max_restarts: 10,
             heartbeat_interval_secs: 30,
             heartbeat_channel: None,
+            max_tick_duration_secs: 300,
         }
     }
 }
@@ -386,6 +391,11 @@ pub struct ModelConfig {
     pub api_key_env: Option<String>,
     /// Optional base URL override for the provider.
     pub base_url: Option<String>,
+    /// Extended thinking configuration. None = thinking disabled.
+    /// Only supported by models that have reasoning capability
+    /// (e.g. Claude Sonnet 4.5+, Claude Sonnet 4.6 via OpenRouter).
+    #[serde(default)]
+    pub thinking: Option<crate::config::ThinkingConfig>,
 }
 
 impl Default for ModelConfig {
@@ -398,6 +408,7 @@ impl Default for ModelConfig {
             system_prompt: "You are a helpful AI agent.".to_string(),
             api_key_env: None,
             base_url: None,
+            thinking: None,
         }
     }
 }
@@ -491,6 +502,10 @@ pub struct AgentManifest {
     /// Tool blocklist — these tools are excluded (applied after allowlist).
     #[serde(default, deserialize_with = "crate::serde_compat::vec_lenient")]
     pub tool_blocklist: Vec<String>,
+    /// Per-agent Programmatic Tool Calling override. If `None`, uses global ptc.enabled.
+    /// Set to `false` to disable PTC for this agent (use traditional tool schemas).
+    #[serde(default)]
+    pub ptc_enabled: Option<bool>,
 }
 
 fn default_true() -> bool {
@@ -525,6 +540,7 @@ impl Default for AgentManifest {
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            ptc_enabled: None,
         }
     }
 }
@@ -615,6 +631,34 @@ pub struct AgentIdentity {
     pub greeting_style: Option<String>,
 }
 
+/// Cached workspace identity files and context for prompt building.
+///
+/// Populated lazily on the first message to an agent, then refreshed
+/// when `refreshed_at` is older than the configured interval (default 60s).
+/// Avoids re-reading identity files from disk on every single message,
+/// which is critical when the underlying filesystem is slow (e.g. FUSE/S3).
+#[derive(Debug, Clone, Default)]
+pub struct PromptCache {
+    /// SOUL.md content (persona definition).
+    pub soul_md: Option<String>,
+    /// USER.md content (user preferences).
+    pub user_md: Option<String>,
+    /// MEMORY.md content (persistent notes).
+    pub memory_md: Option<String>,
+    /// AGENTS.md content (behavioral guidelines).
+    pub agents_md: Option<String>,
+    /// BOOTSTRAP.md content (first-run ritual).
+    pub bootstrap_md: Option<String>,
+    /// IDENTITY.md content (visual identity + personality).
+    pub identity_md: Option<String>,
+    /// HEARTBEAT.md content (autonomous agent checklist).
+    pub heartbeat_md: Option<String>,
+    /// Pre-built workspace context section (project type, git status, etc.).
+    pub workspace_context: Option<String>,
+    /// When this cache was last populated from disk.
+    pub refreshed_at: DateTime<Utc>,
+}
+
 /// A registered agent entry in the kernel's registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentEntry {
@@ -650,6 +694,10 @@ pub struct AgentEntry {
     /// When onboarding was completed.
     #[serde(default)]
     pub onboarding_completed_at: Option<DateTime<Utc>>,
+    /// Cached identity files and workspace context for prompt building.
+    /// Not serialized — populated lazily at runtime, refreshed periodically.
+    #[serde(skip)]
+    pub prompt_cache: Option<Arc<PromptCache>>,
 }
 
 #[cfg(test)]
@@ -722,6 +770,7 @@ mod tests {
         assert_eq!(cfg.max_iterations, 50);
         assert_eq!(cfg.max_restarts, 10);
         assert_eq!(cfg.heartbeat_interval_secs, 30);
+        assert_eq!(cfg.max_tick_duration_secs, 300);
         assert!(cfg.quiet_hours.is_none());
     }
 
@@ -782,6 +831,7 @@ mod tests {
             exec_policy: None,
             tool_allowlist: Vec::new(),
             tool_blocklist: Vec::new(),
+            ptc_enabled: None,
         };
         let json = serde_json::to_string(&manifest).unwrap();
         let deserialized: AgentManifest = serde_json::from_str(&json).unwrap();
@@ -1014,6 +1064,7 @@ mod tests {
             identity: AgentIdentity::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: Default::default(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: AgentEntry = serde_json::from_str(&json).unwrap();
@@ -1076,6 +1127,7 @@ mod tests {
             },
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: Default::default(),
         };
         let json = serde_json::to_string(&entry).unwrap();
         let back: AgentEntry = serde_json::from_str(&json).unwrap();
