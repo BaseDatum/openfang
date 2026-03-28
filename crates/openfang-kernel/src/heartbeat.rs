@@ -332,7 +332,10 @@ mod tests {
                 description: "test".to_string(),
                 author: "test".to_string(),
                 module: "test".to_string(),
-                schedule: ScheduleMode::default(),
+                // Use Periodic so heartbeat doesn't skip these as idle Reactive agents
+                schedule: ScheduleMode::Periodic {
+                    cron: "* * * * *".to_string(),
+                },
                 model: ModelConfig::default(),
                 fallback_models: vec![],
                 resources: ResourceQuota::default(),
@@ -352,6 +355,7 @@ mod tests {
                 exec_policy: None,
                 tool_allowlist: vec![],
                 tool_blocklist: vec![],
+                ptc_enabled: None,
             },
             state,
             mode: AgentMode::default(),
@@ -364,6 +368,7 @@ mod tests {
             identity: Default::default(),
             onboarding_completed: false,
             onboarding_completed_at: None,
+            prompt_cache: None,
         }
     }
 

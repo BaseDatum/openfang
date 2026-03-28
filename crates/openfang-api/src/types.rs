@@ -144,3 +144,99 @@ pub struct ContextGetQuery {
 fn default_max_messages() -> usize {
     10
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic MCP server management types
+// ---------------------------------------------------------------------------
+
+/// A single MCP server configuration for the connect API.
+///
+/// Mirrors `McpServerConfigEntry` but uses the runtime transport representation
+/// so callers (e.g. ASM) can pass complete server configs without knowledge
+/// of openfang's config.toml schema.
+#[derive(Debug, Clone, Deserialize)]
+pub struct McpConnectServerEntry {
+    /// Display name for this server (used in tool namespacing).
+    pub name: String,
+    /// Transport configuration.
+    pub transport: McpConnectTransport,
+    /// Request timeout in seconds (default: 60).
+    #[serde(default = "default_mcp_connect_timeout")]
+    pub timeout_secs: u64,
+    /// Environment variables to pass through to subprocesses.
+    #[serde(default)]
+    pub env: Vec<String>,
+    /// Extra HTTP headers (e.g. `"Authorization: Bearer <token>"`).
+    #[serde(default)]
+    pub headers: Vec<String>,
+}
+
+fn default_mcp_connect_timeout() -> u64 {
+    60
+}
+
+/// Transport type for the connect API.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum McpConnectTransport {
+    Stdio {
+        command: String,
+        #[serde(default)]
+        args: Vec<String>,
+    },
+    Sse {
+        url: String,
+    },
+    Http {
+        url: String,
+    },
+}
+
+/// POST /api/mcp/connect request body.
+#[derive(Debug, Deserialize)]
+pub struct McpConnectRequest {
+    /// MCP server configurations to connect.
+    pub servers: Vec<McpConnectServerEntry>,
+}
+
+/// Result for a single server connection attempt.
+#[derive(Debug, Serialize)]
+pub struct McpConnectServerResult {
+    pub name: String,
+    pub connected: bool,
+    pub tools_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// POST /api/mcp/connect response body.
+#[derive(Debug, Serialize)]
+pub struct McpConnectResponse {
+    pub results: Vec<McpConnectServerResult>,
+    pub total_connected: usize,
+    pub total_failed: usize,
+}
+
+/// GET /api/mcp/status response — per-server connection info.
+#[derive(Debug, Serialize)]
+pub struct McpServerStatus {
+    pub name: String,
+    pub connected: bool,
+    pub tools_count: usize,
+    pub tools: Vec<McpToolInfo>,
+}
+
+/// Tool info within an MCP server status.
+#[derive(Debug, Serialize)]
+pub struct McpToolInfo {
+    pub name: String,
+    pub description: String,
+}
+
+/// GET /api/mcp/status response body.
+#[derive(Debug, Serialize)]
+pub struct McpStatusResponse {
+    pub servers: Vec<McpServerStatus>,
+    pub total_servers: usize,
+    pub total_tools: usize,
+}

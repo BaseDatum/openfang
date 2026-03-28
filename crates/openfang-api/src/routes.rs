@@ -4959,6 +4959,149 @@ pub async fn list_mcp_servers(State(state): State<Arc<AppState>>) -> impl IntoRe
 }
 
 // ---------------------------------------------------------------------------
+// Dynamic MCP server management endpoints
+// ---------------------------------------------------------------------------
+
+/// POST /api/mcp/connect — Dynamically connect to one or more MCP servers.
+///
+/// Accepts full server configs (name, transport URL, headers, env, timeout).
+/// This is the primary API for external orchestrators (e.g. agent-shard-manager)
+/// to provision MCP servers for a user's pod at runtime.
+pub async fn mcp_connect(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<McpConnectRequest>,
+) -> impl IntoResponse {
+    use openfang_runtime::mcp::{McpServerConfig, McpTransport};
+
+    if req.servers.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!(McpConnectResponse {
+                results: vec![],
+                total_connected: 0,
+                total_failed: 0,
+            })),
+        );
+    }
+
+    // Convert API types to runtime types
+    let configs: Vec<McpServerConfig> = req
+        .servers
+        .into_iter()
+        .map(|s| McpServerConfig {
+            name: s.name,
+            transport: match s.transport {
+                McpConnectTransport::Stdio { command, args } => {
+                    McpTransport::Stdio { command, args }
+                }
+                McpConnectTransport::Sse { url } => McpTransport::Sse { url },
+                McpConnectTransport::Http { url } => McpTransport::Http { url },
+            },
+            timeout_secs: s.timeout_secs,
+            env: s.env,
+            headers: s.headers,
+        })
+        .collect();
+
+    let raw_results = state.kernel.connect_mcp_dynamic(configs).await;
+
+    let mut total_connected = 0usize;
+    let mut total_failed = 0usize;
+    let results: Vec<McpConnectServerResult> = raw_results
+        .into_iter()
+        .map(|(name, result)| match result {
+            Ok(tools_count) => {
+                if tools_count > 0 {
+                    total_connected += 1;
+                }
+                // tools_count == 0 means it was already connected (skipped)
+                McpConnectServerResult {
+                    name,
+                    connected: true,
+                    tools_count,
+                    error: None,
+                }
+            }
+            Err(e) => {
+                total_failed += 1;
+                McpConnectServerResult {
+                    name,
+                    connected: false,
+                    tools_count: 0,
+                    error: Some(e),
+                }
+            }
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!(McpConnectResponse {
+            results,
+            total_connected,
+            total_failed,
+        })),
+    )
+}
+
+/// DELETE /api/mcp/disconnect/{name} — Disconnect a single MCP server by name.
+pub async fn mcp_disconnect(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    match state.kernel.disconnect_mcp(&name).await {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "status": "disconnected",
+                "server": name,
+            })),
+        ),
+        Err(e) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "error": e,
+            })),
+        ),
+    }
+}
+
+/// GET /api/mcp/status — Get detailed connection status for all MCP servers.
+pub async fn mcp_status(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let connections = state.kernel.mcp_connections.lock().await;
+    let mut total_tools = 0usize;
+
+    let servers: Vec<McpServerStatus> = connections
+        .iter()
+        .map(|conn| {
+            let tools: Vec<McpToolInfo> = conn
+                .tools()
+                .iter()
+                .map(|t| McpToolInfo {
+                    name: t.name.clone(),
+                    description: t.description.clone(),
+                })
+                .collect();
+            total_tools += tools.len();
+            McpServerStatus {
+                name: conn.name().to_string(),
+                connected: true,
+                tools_count: tools.len(),
+                tools,
+            }
+        })
+        .collect();
+
+    let total_servers = servers.len();
+
+    Json(serde_json::json!(McpStatusResponse {
+        servers,
+        total_servers,
+        total_tools,
+    }))
+}
+
+// ---------------------------------------------------------------------------
 // Audit endpoints
 // ---------------------------------------------------------------------------
 

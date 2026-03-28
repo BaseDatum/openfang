@@ -5296,6 +5296,127 @@ impl OpenFangKernel {
         }
     }
 
+    /// Dynamically connect to one or more MCP servers at runtime.
+    ///
+    /// Accepts full server configs (name, transport, headers, etc.) and connects
+    /// each one. Already-connected servers are skipped. This is the primary API
+    /// for external orchestrators (e.g. agent-shard-manager) to provision MCP
+    /// servers for a user's pod without static config.toml entries.
+    ///
+    /// Returns a vec of `(name, Ok(tool_count))` or `(name, Err(reason))`.
+    pub async fn connect_mcp_dynamic(
+        self: &Arc<Self>,
+        servers: Vec<openfang_runtime::mcp::McpServerConfig>,
+    ) -> Vec<(String, Result<usize, String>)> {
+        use openfang_runtime::mcp::McpConnection;
+        use openfang_runtime::mcp_auth::McpAuthProvider;
+
+        // Obtain a Vault token for MCP auth (if enabled) — same logic as boot.
+        let mcp_auth_token = if self.config.mcp_auth.enabled {
+            let provider = McpAuthProvider::new(self.config.mcp_auth.clone());
+            provider.get_token().await
+        } else {
+            None
+        };
+
+        let already_connected: Vec<String> = self
+            .mcp_connections
+            .lock()
+            .await
+            .iter()
+            .map(|c| c.name().to_string())
+            .collect();
+
+        let mut results = Vec::new();
+
+        for mut server_config in servers {
+            let name = server_config.name.clone();
+
+            // Skip already-connected servers
+            if already_connected.contains(&name) {
+                results.push((name, Ok(0)));
+                continue;
+            }
+
+            // Resolve env vars from vault/dotenv before passing to MCP subprocess.
+            for var_name in &server_config.env {
+                if std::env::var(var_name).is_err() {
+                    if let Some(val) = self.resolve_credential(var_name) {
+                        std::env::set_var(var_name, &val);
+                    }
+                }
+            }
+
+            // Inject Vault auth token for HTTP/SSE transports
+            if let Some(ref token) = mcp_auth_token {
+                if matches!(
+                    server_config.transport,
+                    openfang_runtime::mcp::McpTransport::Http { .. }
+                        | openfang_runtime::mcp::McpTransport::Sse { .. }
+                ) {
+                    // Only add if no Authorization header already present
+                    if !server_config
+                        .headers
+                        .iter()
+                        .any(|h| h.to_lowercase().starts_with("authorization:"))
+                    {
+                        server_config
+                            .headers
+                            .push(format!("Authorization: Bearer {token}"));
+                    }
+                }
+            }
+
+            self.extension_health.register(&name);
+
+            match McpConnection::connect(server_config).await {
+                Ok(conn) => {
+                    let tool_count = conn.tools().len();
+                    if let Ok(mut tools) = self.mcp_tools.lock() {
+                        tools.extend(conn.tools().iter().cloned());
+                    }
+                    self.extension_health.report_ok(&name, tool_count);
+                    info!(server = %name, tools = tool_count, "MCP server connected (dynamic)");
+                    self.mcp_connections.lock().await.push(conn);
+                    results.push((name, Ok(tool_count)));
+                }
+                Err(e) => {
+                    self.extension_health.report_error(&name, e.to_string());
+                    warn!(server = %name, error = %e, "Failed to connect MCP server (dynamic)");
+                    results.push((name, Err(e)));
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Disconnect a single MCP server by name at runtime.
+    ///
+    /// Removes the connection, rebuilds the tool cache, and cleans up health tracking.
+    /// Returns `Ok(())` if the server was found and disconnected, `Err` if not found.
+    pub async fn disconnect_mcp(&self, server_name: &str) -> Result<(), String> {
+        let mut conns = self.mcp_connections.lock().await;
+        let old_len = conns.len();
+        conns.retain(|c| c.name() != server_name);
+
+        if conns.len() == old_len {
+            return Err(format!("MCP server '{server_name}' not connected"));
+        }
+
+        // Rebuild tool cache from remaining connections
+        if let Ok(mut tools) = self.mcp_tools.lock() {
+            tools.clear();
+            for conn in conns.iter() {
+                tools.extend(conn.tools().iter().cloned());
+            }
+        }
+
+        self.extension_health.unregister(server_name);
+        info!(server = %server_name, "MCP server disconnected (dynamic)");
+        Ok(())
+    }
+
     /// Background loop that checks extension MCP health and auto-reconnects.
     async fn run_extension_health_loop(self: &Arc<Self>) {
         let interval_secs = self.extension_health.config().check_interval_secs;

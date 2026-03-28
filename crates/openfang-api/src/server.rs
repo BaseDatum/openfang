@@ -438,6 +438,18 @@ pub async fn build_router(
             "/api/mcp/servers",
             axum::routing::get(routes::list_mcp_servers),
         )
+        .route(
+            "/api/mcp/connect",
+            axum::routing::post(routes::mcp_connect),
+        )
+        .route(
+            "/api/mcp/disconnect/{name}",
+            axum::routing::delete(routes::mcp_disconnect),
+        )
+        .route(
+            "/api/mcp/status",
+            axum::routing::get(routes::mcp_status),
+        )
         // Audit endpoints
         .route(
             "/api/audit/recent",
