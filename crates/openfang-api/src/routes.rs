@@ -7371,6 +7371,132 @@ pub async fn set_agent_tools(
     }
 }
 
+/// GET /api/agents/{id}/tools/effective — Get the resolved tool list for an agent.
+///
+/// Returns all tools available to the agent (builtins + skills + MCP),
+/// grouped by source (builtin, skill, or MCP server name), with each tool
+/// marked as enabled or blocked based on the agent's tool_allowlist/tool_blocklist.
+/// This powers the per-tool toggle UI.
+pub async fn get_agent_effective_tools(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> impl IntoResponse {
+    let agent_id: AgentId = match id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({"error": "Invalid agent ID"})),
+            )
+        }
+    };
+
+    let entry = match state.kernel.registry.get(agent_id) {
+        Some(e) => e,
+        None => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({"error": "Agent not found"})),
+            )
+        }
+    };
+
+    // Get the full tool list *without* allowlist/blocklist filtering
+    // so the UI can show all tools with their enabled/disabled state.
+    let all_tools = state.kernel.get_effective_tools(agent_id);
+
+    // Also compute what the allowlist/blocklist are
+    let tool_allowlist = &entry.manifest.tool_allowlist;
+    let tool_blocklist = &entry.manifest.tool_blocklist;
+
+    // Get all MCP tools (unfiltered) so we can show tools from blocked servers too
+    let mcp_tools_raw: Vec<(String, String, String)> = if let Ok(mcp_tools) = state.kernel.mcp_tools.lock() {
+        mcp_tools
+            .iter()
+            .map(|t| {
+                let server = openfang_runtime::mcp::extract_mcp_server(&t.name)
+                    .unwrap_or("unknown")
+                    .to_string();
+                (t.name.clone(), t.description.clone(), server)
+            })
+            .collect()
+    } else {
+        vec![]
+    };
+
+    // Build the response: group tools by source
+    let mut groups: std::collections::BTreeMap<String, Vec<serde_json::Value>> = std::collections::BTreeMap::new();
+
+    for tool in &all_tools {
+        let source = if tool.name.starts_with("mcp_") {
+            openfang_runtime::mcp::extract_mcp_server(&tool.name)
+                .unwrap_or("mcp")
+                .to_string()
+        } else {
+            "builtin".to_string()
+        };
+
+        let is_blocked = tool_blocklist
+            .iter()
+            .any(|b| b.to_lowercase() == tool.name.to_lowercase());
+        let is_allowed = tool_allowlist.is_empty()
+            || tool_allowlist
+                .iter()
+                .any(|a| a.to_lowercase() == tool.name.to_lowercase());
+
+        groups
+            .entry(source)
+            .or_default()
+            .push(serde_json::json!({
+                "name": tool.name,
+                "description": tool.description,
+                "enabled": is_allowed && !is_blocked,
+            }));
+    }
+
+    // Also include MCP tools that exist but aren't in the agent's current
+    // tool set (e.g. from MCP servers not in the agent's mcp_servers allowlist)
+    let existing_names: std::collections::HashSet<&str> =
+        all_tools.iter().map(|t| t.name.as_str()).collect();
+    for (name, description, server) in &mcp_tools_raw {
+        if !existing_names.contains(name.as_str()) {
+            groups
+                .entry(server.clone())
+                .or_default()
+                .push(serde_json::json!({
+                    "name": name,
+                    "description": description,
+                    "enabled": false,
+                }));
+        }
+    }
+
+    let groups_vec: Vec<serde_json::Value> = groups
+        .into_iter()
+        .map(|(source, tools)| {
+            let enabled_count = tools.iter().filter(|t| t["enabled"].as_bool().unwrap_or(false)).count();
+            serde_json::json!({
+                "source": source,
+                "tools": tools,
+                "total": tools.len(),
+                "enabled": enabled_count,
+            })
+        })
+        .collect();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "agent_id": id,
+            "agent_name": entry.name,
+            "tool_allowlist": tool_allowlist,
+            "tool_blocklist": tool_blocklist,
+            "groups": groups_vec,
+            "total_tools": all_tools.len(),
+        })),
+    )
+}
+
 // ── Per-Agent Skill & MCP Endpoints ────────────────────────────────────
 
 /// GET /api/agents/{id}/skills — Get an agent's skill assignment info.

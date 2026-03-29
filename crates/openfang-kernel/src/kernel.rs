@@ -3273,6 +3273,13 @@ impl OpenFangKernel {
         Ok(())
     }
 
+    /// Get the effective tool list for an agent (public API for routes).
+    ///
+    /// Delegates to `available_tools()` on the `KernelHandle` implementation.
+    pub fn get_effective_tools(&self, agent_id: AgentId) -> Vec<ToolDefinition> {
+        self.available_tools(agent_id)
+    }
+
     /// Update an agent's tool allowlist and/or blocklist.
     pub async fn set_agent_tool_filters(
         &self,

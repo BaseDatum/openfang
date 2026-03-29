@@ -208,6 +208,10 @@ pub async fn build_router(
             axum::routing::get(routes::get_agent_tools).put(routes::set_agent_tools),
         )
         .route(
+            "/api/agents/{id}/tools/effective",
+            axum::routing::get(routes::get_agent_effective_tools),
+        )
+        .route(
             "/api/agents/{id}/skills",
             axum::routing::get(routes::get_agent_skills).put(routes::set_agent_skills),
         )
