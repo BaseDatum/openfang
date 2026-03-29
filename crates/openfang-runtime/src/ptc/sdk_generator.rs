@@ -311,13 +311,19 @@ fn generate_function(tool: &ToolDefinition) -> String {
     )
 }
 
-/// Generate the full Python SDK preamble for all PTC tools.
+/// Generate the full Python SDK module for all PTC tools.
 ///
-/// The preamble includes:
+/// The SDK is written to a file (`_ptc_sdk.py`) inside the agent's workspace
+/// and imported by user code at runtime. The IPC port is read from the
+/// `PTC_IPC_PORT` environment variable so the file remains stable across
+/// agent loop invocations — it only needs regenerating when the tool set
+/// changes (e.g. MCP server added/removed).
+///
+/// The module includes:
 /// - HTTP client setup (urllib.request, zero dependencies)
-/// - The `_ptc_call()` bridge function
+/// - The `_ptc_call()` bridge function (reads port from env)
 /// - One synchronous function per tool
-pub fn generate_python_sdk(tools: &[ToolDefinition], ipc_port: u16) -> String {
+pub fn generate_python_sdk(tools: &[ToolDefinition]) -> String {
     let functions: String = tools
         .iter()
         .map(generate_function)
@@ -326,10 +332,12 @@ pub fn generate_python_sdk(tools: &[ToolDefinition], ipc_port: u16) -> String {
 
     format!(
         r#"# ── PTC SDK (auto-generated) ────────────────────────────────────────────
+# Do not edit — regenerated when tool definitions change.
 import json
+import os
 import urllib.request
 
-_PTC_PORT = {ipc_port}
+_PTC_PORT = int(os.environ["PTC_IPC_PORT"])
 
 def _ptc_call(name: str, args: dict) -> str:
     """Call a tool via the IPC bridge. Returns tool result as string."""
@@ -349,15 +357,56 @@ def _ptc_call(name: str, args: dict) -> str:
         return f"Error calling {{name}}: {{e}}"
 
 {functions}
-
-# ── User code runs below ────────────────────────────────────────────────
 "#
     )
 }
 
-/// Wrap user code with the SDK preamble.
-pub fn wrap_user_code(sdk_preamble: &str, user_code: &str) -> String {
-    format!("{}{}\n", sdk_preamble, user_code)
+/// The directory name inside the workspace where PTC files are stored.
+const PTC_DIR: &str = ".openfang";
+
+/// The filename for the generated SDK module.
+const PTC_SDK_FILENAME: &str = "_ptc_sdk.py";
+
+/// Write the PTC SDK module to `<workspace_root>/.openfang/_ptc_sdk.py`.
+///
+/// Creates the directory if it doesn't exist. Returns the path to the
+/// `.openfang` directory (suitable for setting `PYTHONPATH`).
+pub fn write_sdk_file(
+    tools: &[ToolDefinition],
+    workspace_root: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    let sdk_dir = workspace_root.join(PTC_DIR);
+    std::fs::create_dir_all(&sdk_dir).map_err(|e| {
+        format!(
+            "Failed to create PTC SDK directory {}: {e}",
+            sdk_dir.display()
+        )
+    })?;
+
+    let sdk_content = generate_python_sdk(tools);
+    let sdk_path = sdk_dir.join(PTC_SDK_FILENAME);
+
+    std::fs::write(&sdk_path, &sdk_content)
+        .map_err(|e| format!("Failed to write PTC SDK to {}: {e}", sdk_path.display()))?;
+
+    tracing::debug!(
+        path = %sdk_path.display(),
+        tools = tools.len(),
+        bytes = sdk_content.len(),
+        "PTC SDK file written"
+    );
+
+    Ok(sdk_dir)
+}
+
+/// Return the path to the SDK directory if an SDK file already exists.
+pub fn sdk_dir_if_exists(workspace_root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let sdk_path = workspace_root.join(PTC_DIR).join(PTC_SDK_FILENAME);
+    if sdk_path.exists() {
+        Some(workspace_root.join(PTC_DIR))
+    } else {
+        None
+    }
 }
 
 /// Generate compact one-line function signatures for the execute_code tool description.
@@ -529,8 +578,8 @@ mod tests {
             }),
         )];
 
-        let sdk = generate_python_sdk(&tools, 12345);
-        assert!(sdk.contains("_PTC_PORT = 12345"));
+        let sdk = generate_python_sdk(&tools);
+        assert!(sdk.contains("int(os.environ[\"PTC_IPC_PORT\"])"));
         assert!(sdk.contains("def _ptc_call(name: str, args: dict) -> str:"));
         assert!(sdk.contains("def file_read(path: str) -> str:"));
         assert!(sdk.contains("urllib.request"));

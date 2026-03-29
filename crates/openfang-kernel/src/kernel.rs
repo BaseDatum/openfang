@@ -1454,6 +1454,16 @@ impl OpenFangKernel {
 
         info!(agent = %name, id = %agent_id, "Agent spawned");
 
+        // Write PTC SDK file to the agent's workspace so execute_code can
+        // `from _ptc_sdk import *` without passing the full SDK via -c args.
+        // The SDK is stable until MCP servers change.
+        if let Some(ref ws) = entry.manifest.workspace {
+            let tools = self.available_tools(agent_id);
+            if let Err(e) = openfang_runtime::ptc::write_sdk_file(&tools, ws) {
+                warn!(agent = %name, "Failed to write PTC SDK: {e}");
+            }
+        }
+
         // SECURITY: Record agent spawn in audit trail
         self.audit_log.record(
             agent_id.to_string(),
@@ -5086,6 +5096,8 @@ impl OpenFangKernel {
                 "MCP: {tool_count} tools available from {} server(s)",
                 self.mcp_connections.lock().await.len()
             );
+            // Write PTC SDK files for all existing agents now that MCP tools are available
+            self.regenerate_ptc_sdk_files();
         }
     }
 
@@ -5226,6 +5238,12 @@ impl OpenFangKernel {
             connected_count,
             removed.len()
         );
+
+        // Regenerate PTC SDK files for all agents since tool definitions changed
+        if connected_count > 0 || !removed.is_empty() {
+            self.regenerate_ptc_sdk_files();
+        }
+
         Ok(connected_count)
     }
 
@@ -5294,6 +5312,8 @@ impl OpenFangKernel {
                     "Extension MCP server reconnected"
                 );
                 self.mcp_connections.lock().await.push(conn);
+                // Regenerate PTC SDK files since tool definitions changed
+                self.regenerate_ptc_sdk_files();
                 Ok(tool_count)
             }
             Err(e) => {
@@ -5395,6 +5415,11 @@ impl OpenFangKernel {
             }
         }
 
+        // Regenerate PTC SDK files if any new servers connected
+        if results.iter().any(|(_, r)| matches!(r, Ok(n) if *n > 0)) {
+            self.regenerate_ptc_sdk_files();
+        }
+
         results
     }
 
@@ -5421,7 +5446,34 @@ impl OpenFangKernel {
 
         self.extension_health.unregister(server_name);
         info!(server = %server_name, "MCP server disconnected (dynamic)");
+
+        // Regenerate PTC SDK files since tool definitions changed
+        self.regenerate_ptc_sdk_files();
+
         Ok(())
+    }
+
+    /// Regenerate PTC SDK files for all agents that have a workspace.
+    ///
+    /// Called whenever the tool set changes (MCP server connect/disconnect/reload).
+    /// Each agent gets an SDK file written to `<workspace>/.openfang/_ptc_sdk.py`
+    /// containing Python stubs for all tools available to that agent.
+    fn regenerate_ptc_sdk_files(&self) {
+        let agents = self.registry.list();
+        let mut updated = 0u32;
+        for agent in &agents {
+            if let Some(ref ws) = agent.manifest.workspace {
+                let tools = self.available_tools(agent.id);
+                if let Err(e) = openfang_runtime::ptc::write_sdk_file(&tools, ws) {
+                    warn!(agent = %agent.name, "Failed to regenerate PTC SDK: {e}");
+                } else {
+                    updated += 1;
+                }
+            }
+        }
+        if updated > 0 {
+            info!(agents = updated, "PTC SDK files regenerated after tool change");
+        }
     }
 
     /// Background loop that checks extension MCP health and auto-reconnects.

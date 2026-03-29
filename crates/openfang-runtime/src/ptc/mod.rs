@@ -28,11 +28,11 @@ pub mod sdk_generator;
 pub mod tool_classifier;
 
 use openfang_types::tool::ToolDefinition;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
-pub use executor::{execute_python, is_python3_available};
+pub use executor::{execute_python, is_python3_available, PtcEnv};
 pub use ipc_server::{PtcIpcServer, PtcToolRequest};
-pub use sdk_generator::{generate_compact_reference, generate_python_sdk, wrap_user_code};
+pub use sdk_generator::{generate_compact_reference, generate_python_sdk, write_sdk_file, sdk_dir_if_exists};
 pub use tool_classifier::{classify_tools, PtcMode};
 
 /// Configuration for Programmatic Tool Calling.
@@ -58,7 +58,9 @@ impl Default for PtcConfig {
 
 /// A running PTC instance for a single agent loop execution.
 ///
-/// Created at agent loop start, shut down at loop end.
+/// Created at agent loop start, shut down at loop end. The SDK file is
+/// written separately (at agent creation / MCP change time) and referenced
+/// by `sdk_dir` here.
 pub struct PtcInstance {
     /// The IPC server handling tool calls from Python.
     pub ipc_server: PtcIpcServer,
@@ -68,6 +70,9 @@ pub struct PtcInstance {
     pub ptc_tools: Vec<ToolDefinition>,
     /// The execute_code tool definition (includes compact function reference).
     pub execute_code_tool: ToolDefinition,
+    /// Path to the directory containing `_ptc_sdk.py` (for `PYTHONPATH`).
+    /// `None` if no workspace is available (PTC will be degraded).
+    pub sdk_dir: Option<PathBuf>,
 }
 
 impl PtcInstance {
@@ -77,15 +82,26 @@ impl PtcInstance {
         tools.push(self.execute_code_tool.clone());
         tools
     }
+
+    /// Build the [`PtcEnv`] for subprocess execution, if SDK is available.
+    pub fn ptc_env(&self) -> Option<PtcEnv> {
+        self.sdk_dir.as_ref().map(|dir| PtcEnv {
+            sdk_dir: dir.clone(),
+            ipc_port: self.ipc_server.port(),
+        })
+    }
 }
 
 /// Initialize PTC for an agent loop execution.
 ///
 /// Starts the IPC server, classifies tools, generates the execute_code tool,
-/// and returns the PTC instance. The caller must poll `ptc_instance.ipc_server.request_rx`
+/// and returns the PTC instance. The SDK file is assumed to already exist at
+/// `workspace_root/.openfang/_ptc_sdk.py` (written at agent creation or MCP
+/// server change time). The caller must poll `ptc_instance.ipc_server.request_rx`
 /// to dispatch tool calls from the IPC server.
 pub async fn init_ptc(
     all_tools: &[ToolDefinition],
+    workspace_root: Option<&Path>,
 ) -> Result<PtcInstance, String> {
     // Check python3 availability first (cached after first call)
     if !is_python3_available() {
@@ -104,10 +120,21 @@ pub async fn init_ptc(
     let compact_ref = generate_compact_reference(&ptc_tools);
     let execute_code_tool = build_execute_code_definition(&compact_ref);
 
+    // Locate the pre-written SDK file in the workspace
+    let sdk_dir = workspace_root.and_then(sdk_dir_if_exists);
+
+    if sdk_dir.is_none() && !ptc_tools.is_empty() {
+        tracing::warn!(
+            "PTC SDK file not found in workspace — execute_code will run without SDK import. \
+             This may fail for large tool sets (E2BIG). Ensure the SDK is written at agent creation."
+        );
+    }
+
     tracing::info!(
         direct = direct_tools.len(),
         ptc = ptc_tools.len(),
         port = ipc_server.port(),
+        sdk_dir = ?sdk_dir,
         "PTC initialized"
     );
 
@@ -116,6 +143,7 @@ pub async fn init_ptc(
         direct_tools,
         ptc_tools,
         execute_code_tool,
+        sdk_dir,
     })
 }
 
@@ -152,7 +180,7 @@ fn build_execute_code_definition(compact_ref: &str) -> ToolDefinition {
     }
 }
 
-/// Execute the `execute_code` tool: generate SDK, run Python, return output.
+/// Execute the `execute_code` tool: run Python with SDK import, return output.
 ///
 /// This is a standalone helper for executing PTC code without the select loop.
 /// The agent loop uses an inline version that concurrently polls the IPC channel.
@@ -161,23 +189,17 @@ fn build_execute_code_definition(compact_ref: &str) -> ToolDefinition {
 pub async fn run_execute_code(
     code: &str,
     timeout_secs: u64,
-    ptc_tools: &[ToolDefinition],
-    ipc_port: u16,
     config: &PtcConfig,
     workspace_root: Option<&Path>,
+    ptc_env: Option<&PtcEnv>,
 ) -> String {
-    // Generate the full SDK preamble + wrap user code
-    let sdk = generate_python_sdk(ptc_tools, ipc_port);
-    let full_script = wrap_user_code(&sdk, code);
-
     tracing::debug!(
         code_len = code.len(),
         timeout_secs,
-        ptc_tools = ptc_tools.len(),
         "Executing PTC code"
     );
 
-    let result = execute_python(&full_script, timeout_secs, workspace_root).await;
+    let result = execute_python(code, timeout_secs, workspace_root, ptc_env).await;
 
     // Combine stdout and stderr for the response
     let mut parts: Vec<String> = Vec::new();

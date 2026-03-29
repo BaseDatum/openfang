@@ -390,7 +390,7 @@ pub async fn run_agent_loop(
 
     let mut ptc_instance: Option<crate::ptc::PtcInstance> =
         if ptc_global_enabled && !available_tools.is_empty() {
-            match crate::ptc::init_ptc(available_tools).await {
+            match crate::ptc::init_ptc(available_tools, workspace_root).await {
                 Ok(instance) => Some(instance),
                 Err(e) => {
                     warn!("PTC initialization failed, falling back to direct tools: {e}");
@@ -875,14 +875,14 @@ pub async fn run_agent_loop(
                             .unwrap_or(ptc_config.timeout_secs)
                             .clamp(10, 600);
 
-                        // Generate SDK and run Python
-                        let sdk = crate::ptc::generate_python_sdk(&ptc.ptc_tools, ptc.ipc_server.port());
-                        let full_script = crate::ptc::wrap_user_code(&sdk, code);
-
-                        // Spawn the Python subprocess as a future
+                        // Spawn the Python subprocess as a future.
+                        // The SDK is pre-written to disk; we just set env vars so
+                        // `from _ptc_sdk import *` resolves at import time.
                         let ws = workspace_root.map(|p| p.to_path_buf());
+                        let ptc_env = ptc.ptc_env();
+                        let code_owned = code.to_string();
                         let mut python_fut = tokio::spawn(async move {
-                            crate::ptc::execute_python(&full_script, ptc_timeout, ws.as_deref()).await
+                            crate::ptc::execute_python(&code_owned, ptc_timeout, ws.as_deref(), ptc_env.as_ref()).await
                         });
 
                         // Concurrently handle IPC tool requests while Python runs.
@@ -1708,7 +1708,7 @@ pub async fn run_agent_loop_streaming(
 
     let mut ptc_instance: Option<crate::ptc::PtcInstance> =
         if ptc_global_enabled && !available_tools.is_empty() {
-            match crate::ptc::init_ptc(available_tools).await {
+            match crate::ptc::init_ptc(available_tools, workspace_root).await {
                 Ok(instance) => Some(instance),
                 Err(e) => {
                     warn!("PTC initialization failed (streaming), falling back to direct tools: {e}");
@@ -2180,12 +2180,11 @@ pub async fn run_agent_loop_streaming(
                             .unwrap_or(ptc_config.timeout_secs)
                             .clamp(10, 600);
 
-                        let sdk = crate::ptc::generate_python_sdk(&ptc.ptc_tools, ptc.ipc_server.port());
-                        let full_script = crate::ptc::wrap_user_code(&sdk, code);
-
                         let ws = workspace_root.map(|p| p.to_path_buf());
+                        let ptc_env = ptc.ptc_env();
+                        let code_owned = code.to_string();
                         let mut python_fut = tokio::spawn(async move {
-                            crate::ptc::execute_python(&full_script, ptc_timeout, ws.as_deref()).await
+                            crate::ptc::execute_python(&code_owned, ptc_timeout, ws.as_deref(), ptc_env.as_ref()).await
                         });
 
                         let python_result: Option<crate::ptc::executor::PythonResult> = loop {

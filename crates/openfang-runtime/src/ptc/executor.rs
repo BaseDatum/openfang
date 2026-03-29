@@ -2,8 +2,13 @@
 //!
 //! Spawns `python3 -u -c <script>` as a child process, captures stdout/stderr,
 //! and enforces a timeout by killing the process.
+//!
+//! When a PTC SDK file exists in the workspace (written at agent creation /
+//! MCP change time), user code is prefixed with `from _ptc_sdk import *` and
+//! the subprocess receives `PYTHONPATH` + `PTC_IPC_PORT` env vars. This keeps
+//! the `-c` argument small regardless of how many tools exist.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, Ordering};
 use tracing::{debug, warn};
 
@@ -46,23 +51,46 @@ pub struct PythonResult {
     pub exit_code: i32,
 }
 
+/// PTC-specific environment passed to the Python subprocess.
+///
+/// When present, the executor sets `PYTHONPATH` so `from _ptc_sdk import *`
+/// resolves the pre-generated SDK file, and `PTC_IPC_PORT` so the SDK knows
+/// which localhost port to call.
+#[derive(Debug, Clone)]
+pub struct PtcEnv {
+    /// Directory containing `_ptc_sdk.py` (set as `PYTHONPATH`).
+    pub sdk_dir: PathBuf,
+    /// IPC server port for this agent loop invocation.
+    pub ipc_port: u16,
+}
+
 /// Execute a Python script in a subprocess.
 ///
 /// The script is passed via `-c` flag. The process runs with:
 /// - `PYTHONUNBUFFERED=1` to prevent output buffering
 /// - `cwd` set to the workspace root (if provided)
+/// - When `ptc_env` is provided: `PYTHONPATH` and `PTC_IPC_PORT` are set, and
+///   `from _ptc_sdk import *` is prepended to the user code.
 ///
 /// If the process exceeds `timeout_secs`, it is killed.
 pub async fn execute_python(
-    script: &str,
+    user_code: &str,
     timeout_secs: u64,
     workspace_root: Option<&Path>,
+    ptc_env: Option<&PtcEnv>,
 ) -> PythonResult {
     use tokio::process::Command;
     use tokio::io::AsyncReadExt;
 
+    // Build the -c script: import SDK preamble (if PTC) + user code
+    let script = if ptc_env.is_some() {
+        format!("from _ptc_sdk import *\n{user_code}\n")
+    } else {
+        user_code.to_string()
+    };
+
     let mut cmd = Command::new("python3");
-    cmd.arg("-u").arg("-c").arg(script);
+    cmd.arg("-u").arg("-c").arg(&script);
 
     // Set working directory
     if let Some(root) = workspace_root {
@@ -71,6 +99,12 @@ pub async fn execute_python(
 
     // Environment: unbuffered Python + inherit parent
     cmd.env("PYTHONUNBUFFERED", "1");
+
+    // PTC environment: PYTHONPATH for SDK import, port for IPC
+    if let Some(env) = ptc_env {
+        cmd.env("PYTHONPATH", &env.sdk_dir);
+        cmd.env("PTC_IPC_PORT", env.ipc_port.to_string());
+    }
 
     // Spawn with piped stdio
     cmd.stdout(std::process::Stdio::piped());
@@ -93,7 +127,7 @@ pub async fn execute_python(
     };
 
     let pid = child.id();
-    debug!(pid, timeout_secs, "Python subprocess started");
+    debug!(pid, timeout_secs, script_len = script.len(), "Python subprocess started");
 
     // Read stdout/stderr concurrently with timeout
     let mut stdout_pipe = child.stdout.take().unwrap();
@@ -149,21 +183,21 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_simple_python() {
-        let result = execute_python("print('hello world')", 10, None).await;
+        let result = execute_python("print('hello world')", 10, None, None).await;
         assert_eq!(result.exit_code, 0);
         assert_eq!(result.stdout.trim(), "hello world");
     }
 
     #[tokio::test]
     async fn test_execute_python_error() {
-        let result = execute_python("raise ValueError('test error')", 10, None).await;
+        let result = execute_python("raise ValueError('test error')", 10, None, None).await;
         assert_ne!(result.exit_code, 0);
         assert!(result.stderr.contains("ValueError"));
     }
 
     #[tokio::test]
     async fn test_execute_python_timeout() {
-        let result = execute_python("import time; time.sleep(60)", 1, None).await;
+        let result = execute_python("import time; time.sleep(60)", 1, None, None).await;
         assert_ne!(result.exit_code, 0);
         assert!(
             result.stderr.contains("timed out") || result.exit_code != 0
