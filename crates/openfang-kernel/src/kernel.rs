@@ -5840,7 +5840,10 @@ impl OpenFangKernel {
             });
         }
 
-        // Step 3: Add MCP tools
+        // Step 3: Add MCP tools.
+        // For the unfiltered variant we skip the `declared_tools` gate so
+        // the UI can display every MCP tool with its enabled/disabled state.
+        // Server-level filtering (mcp_allowlist) is still honoured.
         if let Ok(mcp_tools) = self.mcp_tools.lock() {
             let mcp_candidates: Vec<ToolDefinition> = if mcp_allowlist.is_empty() {
                 mcp_tools.iter().cloned().collect()
@@ -5859,13 +5862,7 @@ impl OpenFangKernel {
                     .cloned()
                     .collect()
             };
-            let mcp_explicitly_opted_in = !mcp_allowlist.is_empty();
             for t in mcp_candidates {
-                if !tools_unrestricted && !mcp_explicitly_opted_in
-                    && !declared_tools.iter().any(|d| d == &t.name)
-                {
-                    continue;
-                }
                 all_tools.push(t);
             }
         }
