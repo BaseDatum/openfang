@@ -44,6 +44,7 @@ pub mod reply_directives;
 pub mod retry;
 pub mod routing;
 pub mod sandbox;
+pub mod secret_registry;
 pub mod session_repair;
 pub mod shell_bleed;
 pub mod str_utils;

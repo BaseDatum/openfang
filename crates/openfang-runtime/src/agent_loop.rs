@@ -885,6 +885,11 @@ pub async fn run_agent_loop(
                             crate::ptc::execute_python(&code_owned, ptc_timeout, ws.as_deref(), ptc_env.as_ref()).await
                         });
 
+                        // Secret registry: tracks secrets fetched during this PTC
+                        // turn so we can redact them from stdout/stderr before the
+                        // output re-enters the LLM context.
+                        let mut secret_registry = crate::secret_registry::SecretRegistry::new();
+
                         // Concurrently handle IPC tool requests while Python runs.
                         // JoinHandle is Unpin so we can select! on &mut directly.
                         let python_result: Option<crate::ptc::executor::PythonResult> = loop {
@@ -899,6 +904,7 @@ pub async fn run_agent_loop(
                                     if let Some(ref kh) = kernel {
                                         kh.touch_active(&caller_id_str);
                                     }
+                                    let is_secret_fetch = req.tool_name == crate::secret_registry::SECRET_TOOL_NAME;
                                     let eff_exec_policy = manifest.exec_policy.as_ref();
                                     let tool_result = tool_runner::execute_tool(
                                         &req.tool_call_id,
@@ -924,6 +930,18 @@ pub async fn run_agent_loop(
                                         process_manager,
                                     )
                                     .await;
+
+                                    // Intercept get_secret_value results: record the
+                                    // secret in the registry so we can redact it from
+                                    // stdout/stderr after Python exits.
+                                    if is_secret_fetch && !tool_result.is_error {
+                                        if let Some((name, value)) =
+                                            crate::secret_registry::SecretRegistry::parse_secret_from_tool_result(&tool_result.content)
+                                        {
+                                            secret_registry.insert(name, value);
+                                        }
+                                    }
+
                                     let _ = req.response_tx.send(tool_result);
                                 }
                             }
@@ -934,6 +952,7 @@ pub async fn run_agent_loop(
                                 py,
                                 &tool_call.id,
                                 ptc_config.max_stdout_bytes,
+                                Some(&secret_registry),
                             ),
                             None => openfang_types::tool::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
@@ -941,6 +960,8 @@ pub async fn run_agent_loop(
                                 is_error: true,
                             },
                         }
+                        // secret_registry is dropped here — all Zeroizing<String>
+                        // values are scrubbed from memory.
                     } else {
                     match tokio::time::timeout(
                         timeout,
@@ -2187,6 +2208,9 @@ pub async fn run_agent_loop_streaming(
                             crate::ptc::execute_python(&code_owned, ptc_timeout, ws.as_deref(), ptc_env.as_ref()).await
                         });
 
+                        // Secret registry for stdout/stderr redaction (streaming).
+                        let mut secret_registry = crate::secret_registry::SecretRegistry::new();
+
                         let python_result: Option<crate::ptc::executor::PythonResult> = loop {
                             tokio::select! {
                                 py_result = &mut python_fut => {
@@ -2197,6 +2221,7 @@ pub async fn run_agent_loop_streaming(
                                     if let Some(ref kh) = kernel {
                                         kh.touch_active(&caller_id_str);
                                     }
+                                    let is_secret_fetch = req.tool_name == crate::secret_registry::SECRET_TOOL_NAME;
                                     let eff_exec_policy = manifest.exec_policy.as_ref();
                                     let tool_result = tool_runner::execute_tool(
                                         &req.tool_call_id,
@@ -2218,6 +2243,16 @@ pub async fn run_agent_loop_streaming(
                                         process_manager,
                                     )
                                     .await;
+
+                                    // Intercept get_secret_value results (streaming).
+                                    if is_secret_fetch && !tool_result.is_error {
+                                        if let Some((name, value)) =
+                                            crate::secret_registry::SecretRegistry::parse_secret_from_tool_result(&tool_result.content)
+                                        {
+                                            secret_registry.insert(name, value);
+                                        }
+                                    }
+
                                     let _ = req.response_tx.send(tool_result);
                                 }
                             }
@@ -2228,6 +2263,7 @@ pub async fn run_agent_loop_streaming(
                                 py,
                                 &tool_call.id,
                                 ptc_config.max_stdout_bytes,
+                                Some(&secret_registry),
                             ),
                             None => openfang_types::tool::ToolResult {
                                 tool_use_id: tool_call.id.clone(),
@@ -2471,11 +2507,20 @@ pub async fn run_agent_loop_streaming(
 /// 12. `tool_name\n{"key":"value"}` — bare name + JSON on next line (Llama 4 Scout)
 /// 13. `<tool_use>{"name":"tool","arguments":{...}}</tool_use>` — Llama 3.1+ variant
 ///
-/// Build a ToolResult from a PythonResult, applying output truncation.
+/// Build a ToolResult from a PythonResult, applying output truncation
+/// and secret redaction.
+///
+/// If `secret_registry` is provided and contains recorded secrets, all
+/// known secret values are scrubbed from stdout/stderr before the output
+/// enters the LLM context.  This is the **real security boundary** for
+/// the user secrets system — the Python-side `SecretValue.__str__` masking
+/// is an ergonomic convenience that the LLM could override, but this
+/// kernel-level redaction cannot be bypassed.
 fn ptc_python_result_to_tool_result(
     py: crate::ptc::executor::PythonResult,
     tool_use_id: &str,
     max_stdout_bytes: usize,
+    secret_registry: Option<&crate::secret_registry::SecretRegistry>,
 ) -> openfang_types::tool::ToolResult {
     let mut parts: Vec<String> = Vec::new();
     if !py.stdout.trim().is_empty() {
@@ -2496,11 +2541,22 @@ fn ptc_python_result_to_tool_result(
         }
         parts.push(format!("\n[exit code: {}]", py.exit_code));
     }
-    let output = if parts.is_empty() {
+    let mut output = if parts.is_empty() {
         "(no output)".to_string()
     } else {
         parts.join("\n")
     };
+
+    // ── Secret redaction (security boundary) ──────────────────────
+    // Scrub any known secret values from the output before it enters
+    // the LLM context.  Even if the LLM overrides SecretValue.__str__
+    // or prints secret.value directly, the kernel catches it here.
+    if let Some(registry) = secret_registry {
+        if !registry.is_empty() {
+            output = registry.redact(&output);
+        }
+    }
+
     openfang_types::tool::ToolResult {
         tool_use_id: tool_use_id.to_string(),
         content: output,

@@ -301,14 +301,34 @@ fn generate_function(tool: &ToolDefinition) -> String {
         .trim()
         .to_string();
 
-    format!(
-        "def {}({}) -> str:\n    \"\"\"{}\"\"\"    \n    return _ptc_call(\"{}\", {})",
-        fn_name,
-        param_parts.join(", "),
-        raw_desc,
-        tool.name,
-        args_expr
-    )
+    // Special handling for get_secret_value: wrap the IPC result in
+    // SecretValue so that str/repr/format display is masked.
+    if tool.name == crate::secret_registry::SECRET_TOOL_NAME {
+        // Extract the "name" parameter from the function params for the wrapper.
+        let name_param = params
+            .iter()
+            .find(|p| p.original_name == "name")
+            .map(|p| p.name.as_str())
+            .unwrap_or("\"unknown\"");
+        format!(
+            "def {}({}) -> \"SecretValue\":\n    \"\"\"{}\"\"\"    \n    return _wrap_secret(_ptc_call(\"{}\", {}), {})",
+            fn_name,
+            param_parts.join(", "),
+            raw_desc,
+            tool.name,
+            args_expr,
+            name_param,
+        )
+    } else {
+        format!(
+            "def {}({}) -> str:\n    \"\"\"{}\"\"\"    \n    return _ptc_call(\"{}\", {})",
+            fn_name,
+            param_parts.join(", "),
+            raw_desc,
+            tool.name,
+            args_expr
+        )
+    }
 }
 
 /// Generate the full Python SDK module for all PTC tools.
@@ -355,6 +375,70 @@ def _ptc_call(name: str, args: dict) -> str:
         return f"Error calling {{name}}: {{e.code}} - {{body}}"
     except Exception as e:
         return f"Error calling {{name}}: {{e}}"
+
+
+# ── Secret support ─────────────────────────────────────────────────────
+# SecretValue wraps secret plaintext with masked display.  str/repr/format
+# all show [SECRET:<name>] instead of the real value.  Use .value for
+# programmatic access (e.g. in HTTP headers).
+#
+# This is an ergonomic convenience — the real security boundary is the
+# kernel-level stdout redaction that scrubs secret values from all output
+# before it re-enters the LLM context.  Even if this class is overridden
+# or .value is printed, the kernel catches and redacts it.
+
+class SecretValue:
+    """Opaque secret handle with masked display.  Use .value for the raw string."""
+    __slots__ = ("_name", "_value")
+
+    def __init__(self, name: str, value: str):
+        self._name = name
+        self._value = value
+
+    def __str__(self):
+        return f"[SECRET:{{self._name}}]"
+
+    def __repr__(self):
+        return f"SecretValue('{{self._name}}')"
+
+    def __format__(self, spec):
+        return f"[SECRET:{{self._name}}]"
+
+    def __add__(self, other):
+        return str(self) + str(other)
+
+    def __radd__(self, other):
+        return str(other) + str(self)
+
+    def __bool__(self):
+        return bool(self._value)
+
+    def __len__(self):
+        return len(self._value)
+
+    @property
+    def name(self) -> str:
+        """The secret's name."""
+        return self._name
+
+    @property
+    def value(self) -> str:
+        """The raw secret string for programmatic use (e.g. headers, auth)."""
+        return self._value
+
+
+def _wrap_secret(raw: str, name: str) -> "SecretValue":
+    """Parse a get_secret_value JSON response and wrap in SecretValue."""
+    try:
+        data = json.loads(raw)
+        if isinstance(data, dict):
+            if "error" in data:
+                raise RuntimeError(f"Secret error: {{data['error']}}")
+            return SecretValue(data.get("name", name), data.get("value", raw))
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return SecretValue(name, raw)
+
 
 {functions}
 "#
