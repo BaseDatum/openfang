@@ -3514,6 +3514,12 @@ pub async fn list_skills(State(state): State<Arc<AppState>>) -> impl IntoRespons
                 Some(openfang_skills::SkillSource::Bundled) => {
                     serde_json::json!({"type": "bundled"})
                 }
+                Some(openfang_skills::SkillSource::UserInstalled {
+                    source_type,
+                    source_ref,
+                }) => {
+                    serde_json::json!({"type": "user_installed", "source_type": source_type, "source_ref": source_ref})
+                }
                 Some(openfang_skills::SkillSource::Native) | None => {
                     serde_json::json!({"type": "local"})
                 }
@@ -3600,6 +3606,188 @@ pub async fn uninstall_skill(
 pub async fn reload_skills(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     state.kernel.reload_skills();
     Json(serde_json::json!({"status": "reloaded"}))
+}
+
+/// POST /api/skills/install-content — Install a skill from raw content.
+///
+/// Called by the api-server when a user uploads a SKILL.md or pastes content
+/// via the web UI.  Writes the content to the skills directory and hot-reloads.
+pub async fn install_skill_content(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<crate::types::SkillInstallContentRequest>,
+) -> impl IntoResponse {
+    let skills_dir = state.kernel.config.home_dir.join("skills");
+    let skill_dir = skills_dir.join(&req.name);
+
+    // Create skill directory
+    if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to create skill dir: {e}")})),
+        );
+    }
+
+    // Write SKILL.md (the registry's load_all will auto-convert to skill.toml)
+    let skill_file = skill_dir.join("SKILL.md");
+    if let Err(e) = std::fs::write(&skill_file, &req.content) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({"error": format!("Failed to write skill file: {e}")})),
+        );
+    }
+
+    // Write source provenance marker so the kernel knows this is user-installed
+    if let Some(ref source) = req.source {
+        let source_file = skill_dir.join(".source.json");
+        let _ = std::fs::write(&source_file, serde_json::to_string_pretty(source).unwrap_or_default());
+    }
+
+    // Hot-reload so agents see the new skill immediately
+    state.kernel.reload_skills();
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "status": "installed",
+            "name": req.name,
+            "method": "content",
+        })),
+    )
+}
+
+/// POST /api/skills/install-remote — Install a skill from a remote source.
+///
+/// Called by the api-server when a user adds a skill from URL, Git, or ClawHub.
+/// For URL sources, fetches the content and writes it.
+/// For ClawHub, delegates to the existing ClawHub install logic.
+/// For Git, clones the repo into the skills directory.
+pub async fn install_skill_remote(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<crate::types::SkillInstallRemoteRequest>,
+) -> impl IntoResponse {
+    let skills_dir = state.kernel.config.home_dir.join("skills");
+
+    match req.source_type.as_str() {
+        "url" => {
+            // Fetch content from URL
+            let content = match reqwest::get(&req.source_ref).await {
+                Ok(resp) => match resp.text().await {
+                    Ok(text) => text,
+                    Err(e) => {
+                        return (
+                            StatusCode::BAD_REQUEST,
+                            Json(serde_json::json!({"error": format!("Failed to read URL: {e}")})),
+                        );
+                    }
+                },
+                Err(e) => {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({"error": format!("Failed to fetch URL: {e}")})),
+                    );
+                }
+            };
+
+            let skill_dir = skills_dir.join(&req.name);
+            if let Err(e) = std::fs::create_dir_all(&skill_dir) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to create dir: {e}")})),
+                );
+            }
+
+            let skill_file = skill_dir.join("SKILL.md");
+            if let Err(e) = std::fs::write(&skill_file, &content) {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Failed to write file: {e}")})),
+                );
+            }
+
+            // Write source provenance
+            let source = serde_json::json!({
+                "type": "user_installed",
+                "source_type": "url",
+                "source_ref": req.source_ref,
+            });
+            let _ = std::fs::write(
+                skill_dir.join(".source.json"),
+                serde_json::to_string_pretty(&source).unwrap_or_default(),
+            );
+
+            state.kernel.reload_skills();
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "status": "installed",
+                    "name": req.name,
+                    "method": "url",
+                })),
+            )
+        }
+        "clawhub" => {
+            // Delegate to existing ClawHub install
+            let cache_dir = state.kernel.config.home_dir.join("cache").join("clawhub");
+            let client = openfang_skills::clawhub::ClawHubClient::new(cache_dir);
+
+            match client.install(&req.source_ref, &skills_dir).await {
+                Ok(result) => {
+                    state.kernel.reload_skills();
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "status": "installed",
+                            "name": result.skill_name,
+                            "method": "clawhub",
+                        })),
+                    )
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("ClawHub install failed: {e}")})),
+                ),
+            }
+        }
+        "git" => {
+            // Shell out to git clone
+            let skill_dir = skills_dir.join(&req.name);
+            let output = tokio::process::Command::new("git")
+                .args(["clone", "--depth", "1", &req.source_ref])
+                .arg(&skill_dir)
+                .output()
+                .await;
+
+            match output {
+                Ok(out) if out.status.success() => {
+                    state.kernel.reload_skills();
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "status": "installed",
+                            "name": req.name,
+                            "method": "git",
+                        })),
+                    )
+                }
+                Ok(out) => {
+                    let stderr = String::from_utf8_lossy(&out.stderr);
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({"error": format!("Git clone failed: {stderr}")})),
+                    )
+                }
+                Err(e) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({"error": format!("Git not available: {e}")})),
+                ),
+            }
+        }
+        other => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"error": format!("Unknown source_type: {other}")})),
+        ),
+    }
 }
 
 /// GET /api/marketplace/search — Search the FangHub marketplace.

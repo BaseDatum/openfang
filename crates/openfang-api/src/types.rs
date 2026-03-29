@@ -73,6 +73,29 @@ pub struct SkillUninstallRequest {
     pub name: String,
 }
 
+/// Request to install a skill from raw content (pushed by api-server).
+#[derive(Debug, Deserialize)]
+pub struct SkillInstallContentRequest {
+    pub name: String,
+    pub content: String,
+    #[serde(default = "default_skill_type")]
+    pub skill_type: String,
+    #[serde(default)]
+    pub source: Option<serde_json::Value>,
+}
+
+fn default_skill_type() -> String {
+    "prompt_only".to_string()
+}
+
+/// Request to install a skill from a remote source (URL/git/clawhub).
+#[derive(Debug, Deserialize)]
+pub struct SkillInstallRemoteRequest {
+    pub name: String,
+    pub source_type: String, // "url", "git", "clawhub"
+    pub source_ref: String,
+}
+
 /// Request to update an agent's manifest.
 #[derive(Debug, Deserialize)]
 pub struct AgentUpdateRequest {

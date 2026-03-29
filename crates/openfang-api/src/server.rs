@@ -362,6 +362,14 @@ pub async fn build_router(
             axum::routing::post(routes::reload_skills),
         )
         .route(
+            "/api/skills/install-content",
+            axum::routing::post(routes::install_skill_content),
+        )
+        .route(
+            "/api/skills/install-remote",
+            axum::routing::post(routes::install_skill_remote),
+        )
+        .route(
             "/api/marketplace/search",
             axum::routing::get(routes::marketplace_search),
         )

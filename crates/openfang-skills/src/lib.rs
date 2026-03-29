@@ -77,6 +77,12 @@ pub enum SkillSource {
     OpenClaw,
     /// Downloaded from ClawHub marketplace.
     ClawHub { slug: String, version: String },
+    /// Installed dynamically by a user via the web UI or macOS app.
+    /// These always receive the strongest prompt containment wrapper.
+    UserInstalled {
+        source_type: String,
+        source_ref: Option<String>,
+    },
 }
 
 /// A tool provided by a skill.
@@ -250,5 +256,21 @@ capabilities = ["NetConnect(*)"]
         let json = serde_json::to_string(&native).unwrap();
         let back: SkillSource = serde_json::from_str(&json).unwrap();
         assert_eq!(back, SkillSource::Native);
+
+        let user_installed = SkillSource::UserInstalled {
+            source_type: "url".to_string(),
+            source_ref: Some("https://example.com/SKILL.md".to_string()),
+        };
+        let json = serde_json::to_string(&user_installed).unwrap();
+        let back: SkillSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, user_installed);
+
+        let user_installed_upload = SkillSource::UserInstalled {
+            source_type: "upload".to_string(),
+            source_ref: None,
+        };
+        let json = serde_json::to_string(&user_installed_upload).unwrap();
+        let back: SkillSource = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, user_installed_upload);
     }
 }
