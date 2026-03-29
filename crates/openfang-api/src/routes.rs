@@ -7403,7 +7403,7 @@ pub async fn get_agent_effective_tools(
 
     // Get the full tool list *without* allowlist/blocklist filtering
     // so the UI can show all tools with their enabled/disabled state.
-    let all_tools = state.kernel.get_effective_tools(agent_id);
+    let all_tools = state.kernel.get_all_tools_unfiltered(agent_id);
 
     // Also compute what the allowlist/blocklist are
     let tool_allowlist = &entry.manifest.tool_allowlist;

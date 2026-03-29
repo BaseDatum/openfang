@@ -3290,6 +3290,14 @@ impl OpenFangKernel {
         self.available_tools(agent_id)
     }
 
+    /// Get ALL tools available to an agent **before** allowlist/blocklist
+    /// filtering (steps 1-3 of the pipeline).  This is used by the
+    /// effective-tools UI endpoint so it can show blocked tools as disabled
+    /// rather than hiding them completely.
+    pub fn get_all_tools_unfiltered(&self, agent_id: AgentId) -> Vec<ToolDefinition> {
+        self.available_tools_unfiltered(agent_id, None)
+    }
+
     /// Update an agent's tool allowlist and/or blocklist.
     pub async fn set_agent_tool_filters(
         &self,
@@ -5718,6 +5726,143 @@ impl OpenFangKernel {
         if exec_blocks_shell {
             all_tools.retain(|t| t.name != "shell_exec");
         }
+
+        all_tools
+    }
+
+    /// Build the list of ALL tools available to an agent (steps 1-3 only),
+    /// **without** applying per-agent tool_allowlist/tool_blocklist (step 4)
+    /// or exec_policy shell_exec removal (step 5).
+    ///
+    /// This is used by the effective-tools UI endpoint so it can present
+    /// blocked/disabled tools to the user for re-enabling.
+    fn available_tools_unfiltered(
+        &self,
+        agent_id: AgentId,
+        skill_snapshot: Option<&openfang_skills::registry::SkillRegistry>,
+    ) -> Vec<ToolDefinition> {
+        let mut all_builtins = if self.config.browser.enabled {
+            builtin_tool_definitions()
+        } else {
+            builtin_tool_definitions()
+                .into_iter()
+                .filter(|t| !t.name.starts_with("browser_"))
+                .collect()
+        };
+
+        if self.config.memory.backend == "hindsight" {
+            all_builtins.extend(openfang_runtime::tool_runner::hindsight_tool_definitions());
+        }
+
+        let entry = self.registry.get(agent_id);
+        let (skill_allowlist, mcp_allowlist, tool_profile) = entry
+            .as_ref()
+            .map(|e| {
+                (
+                    e.manifest.skills.clone(),
+                    e.manifest.mcp_servers.clone(),
+                    e.manifest.profile.clone(),
+                )
+            })
+            .unwrap_or_default();
+
+        let declared_tools: Vec<String> = entry
+            .as_ref()
+            .map(|e| e.manifest.capabilities.tools.clone())
+            .unwrap_or_default();
+
+        let tools_unrestricted =
+            declared_tools.is_empty() || declared_tools.iter().any(|t| t == "*");
+
+        // Step 1: Filter builtin tools by declared tools / profile
+        let has_tool_all = entry.as_ref().is_some_and(|_| {
+            let caps = self.capabilities.list(agent_id);
+            caps.iter().any(|c| matches!(c, Capability::ToolAll))
+        });
+
+        let mut all_tools: Vec<ToolDefinition> = if !tools_unrestricted {
+            all_builtins
+                .into_iter()
+                .filter(|t| declared_tools.iter().any(|d| d == &t.name))
+                .collect()
+        } else {
+            match &tool_profile {
+                Some(profile)
+                    if *profile != ToolProfile::Full && *profile != ToolProfile::Custom =>
+                {
+                    let allowed = profile.tools();
+                    all_builtins
+                        .into_iter()
+                        .filter(|t| allowed.iter().any(|a| a == "*" || a == &t.name))
+                        .collect()
+                }
+                _ if has_tool_all => all_builtins,
+                _ => all_builtins,
+            }
+        };
+
+        // Step 2: Add skill-provided tools
+        let skill_tools = if let Some(snapshot) = skill_snapshot {
+            if skill_allowlist.is_empty() {
+                snapshot.all_tool_definitions()
+            } else {
+                snapshot.tool_definitions_for_skills(&skill_allowlist)
+            }
+        } else {
+            let registry = self
+                .skill_registry
+                .read()
+                .unwrap_or_else(|e| e.into_inner());
+            if skill_allowlist.is_empty() {
+                registry.all_tool_definitions()
+            } else {
+                registry.tool_definitions_for_skills(&skill_allowlist)
+            }
+        };
+        for skill_tool in skill_tools {
+            if !tools_unrestricted && !declared_tools.iter().any(|d| d == &skill_tool.name) {
+                continue;
+            }
+            all_tools.push(ToolDefinition {
+                name: skill_tool.name.clone(),
+                description: skill_tool.description.clone(),
+                input_schema: skill_tool.input_schema.clone(),
+            });
+        }
+
+        // Step 3: Add MCP tools
+        if let Ok(mcp_tools) = self.mcp_tools.lock() {
+            let mcp_candidates: Vec<ToolDefinition> = if mcp_allowlist.is_empty() {
+                mcp_tools.iter().cloned().collect()
+            } else {
+                let normalized: Vec<String> = mcp_allowlist
+                    .iter()
+                    .map(|s| openfang_runtime::mcp::normalize_name(s))
+                    .collect();
+                mcp_tools
+                    .iter()
+                    .filter(|t| {
+                        openfang_runtime::mcp::extract_mcp_server(&t.name)
+                            .map(|s| normalized.iter().any(|n| n == s))
+                            .unwrap_or(false)
+                    })
+                    .cloned()
+                    .collect()
+            };
+            let mcp_explicitly_opted_in = !mcp_allowlist.is_empty();
+            for t in mcp_candidates {
+                if !tools_unrestricted && !mcp_explicitly_opted_in
+                    && !declared_tools.iter().any(|d| d == &t.name)
+                {
+                    continue;
+                }
+                all_tools.push(t);
+            }
+        }
+
+        // NOTE: Steps 4 (allowlist/blocklist) and 5 (exec_policy) are
+        // intentionally skipped — the caller (effective-tools UI) computes
+        // enabled/disabled state itself.
 
         all_tools
     }
