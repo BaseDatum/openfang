@@ -33,6 +33,9 @@ predictions_database.json
 prediction_report_*.md
 BUILD_LOG.md
 
+# Git worktrees
+.worktrees/
+
 # OS
 .DS_Store
 ._*
