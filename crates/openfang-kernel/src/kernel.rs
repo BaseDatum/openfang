@@ -3280,6 +3280,11 @@ impl OpenFangKernel {
         }
 
         info!(agent_id = %agent_id, servers = ?servers, "Agent MCP servers updated");
+
+        // Regenerate PTC SDK so the agent's Python environment reflects
+        // the new server set immediately.
+        self.regenerate_ptc_sdk_files();
+
         Ok(())
     }
 
@@ -3319,6 +3324,11 @@ impl OpenFangKernel {
             blocklist = ?blocklist,
             "Agent tool filters updated"
         );
+
+        // Regenerate PTC SDK so blocked/unblocked tools are reflected
+        // in the agent's Python environment immediately.
+        self.regenerate_ptc_sdk_files();
+
         Ok(())
     }
 
