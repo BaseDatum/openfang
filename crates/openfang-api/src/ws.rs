@@ -12,6 +12,7 @@
 //! Server → Client: `{"type":"silent_complete"}` (agent chose NO_REPLY)
 //! Server → Client: `{"type":"canvas","canvas_id":"...","html":"...","title":"..."}`
 
+use crate::redact::redact_sensitive_tool_result;
 use crate::routes::AppState;
 use axum::extract::ws::{Message, WebSocket};
 use axum::extract::{ConnectInfo, Path, State, WebSocketUpgrade};
@@ -1217,21 +1218,25 @@ fn map_stream_event(event: &StreamEvent, verbose: VerboseLevel) -> Option<serde_
             })),
             VerboseLevel::On => {
                 let truncated: String = result_preview.chars().take(200).collect();
+                let redacted = redact_sensitive_tool_result(&truncated);
                 Some(serde_json::json!({
                     "type": "tool_result",
                     "id": id,
                     "tool": name,
-                    "result": truncated,
+                    "result": redacted,
                     "is_error": is_error,
                 }))
             }
-            VerboseLevel::Full => Some(serde_json::json!({
-                "type": "tool_result",
-                "id": id,
-                "tool": name,
-                "result": result_preview,
-                "is_error": is_error,
-            })),
+            VerboseLevel::Full => {
+                let redacted = redact_sensitive_tool_result(result_preview);
+                Some(serde_json::json!({
+                    "type": "tool_result",
+                    "id": id,
+                    "tool": name,
+                    "result": redacted,
+                    "is_error": is_error,
+                }))
+            }
         },
         StreamEvent::PhaseChange { phase, detail } => Some(serde_json::json!({
             "type": "phase",

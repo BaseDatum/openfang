@@ -19,6 +19,8 @@ use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::Instant;
 
+use crate::redact::redact_sensitive_tool_result;
+
 /// Shared application state.
 ///
 /// The kernel is wrapped in Arc so it can serve as both the main kernel
@@ -589,7 +591,9 @@ pub async fn get_agent_session(
                                         msg.get_mut("tools").and_then(|v| v.as_array_mut())
                                     {
                                         if let Some(tool_obj) = tools_arr.get_mut(tool_idx) {
-                                            tool_obj["result"] = serde_json::Value::String(result.clone());
+                                            tool_obj["result"] = serde_json::Value::String(
+                                                redact_sensitive_tool_result(result),
+                                            );
                                             tool_obj["is_error"] =
                                                 serde_json::Value::Bool(*is_error);
                                         }

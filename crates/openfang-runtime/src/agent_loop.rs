@@ -904,7 +904,7 @@ pub async fn run_agent_loop(
                                     if let Some(ref kh) = kernel {
                                         kh.touch_active(&caller_id_str);
                                     }
-                                    let is_secret_fetch = req.tool_name == crate::secret_registry::SECRET_TOOL_NAME;
+                                    let is_secret_fetch = crate::secret_registry::is_secret_tool(&req.tool_name);
                                     let eff_exec_policy = manifest.exec_policy.as_ref();
                                     let tool_result = tool_runner::execute_tool(
                                         &req.tool_call_id,
@@ -2221,7 +2221,7 @@ pub async fn run_agent_loop_streaming(
                                     if let Some(ref kh) = kernel {
                                         kh.touch_active(&caller_id_str);
                                     }
-                                    let is_secret_fetch = req.tool_name == crate::secret_registry::SECRET_TOOL_NAME;
+                                    let is_secret_fetch = crate::secret_registry::is_secret_tool(&req.tool_name);
                                     let eff_exec_policy = manifest.exec_policy.as_ref();
                                     let tool_result = tool_runner::execute_tool(
                                         &req.tool_call_id,
